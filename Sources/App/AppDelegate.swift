@@ -1127,8 +1127,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                            uniquingKeysWith: { first, _ in first })
         let pairs = ClaudeTokenRefresher.forEveryProfile(
             claudeProviders.map(\.profile),
-            expiry: { profile in await providerByProfile[profile]?.tokenExpiry },
-            reload: { profile in await providerByProfile[profile]?.reloadTokenExpiry() }
+            token: { profile in await providerByProfile[profile]?.storedToken },
+            reload: { profile in await providerByProfile[profile]?.reloadStoredToken() },
+            recheck: { profile in await providerByProfile[profile]?.recheckStoredToken() }
         )
         let refreshers = pairs.map(\.refresher)
         if !refreshers.isEmpty {
@@ -1142,16 +1143,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for (profile, refresher) in pairs {
             guard let provider = providerByProfile[profile] else { continue }
             // The one place the failure becomes visible. The store carries the
-            // fact; nothing here retries, and the warning clears itself the
-            // moment a reading comes back.
-            refresher.$outcome
-                .receive(on: RunLoop.main)
-                .sink { [weak self] outcome in
-                    guard case .failed = outcome else { return }
-                    self?.store?.reportRenewalFailed(providerID: provider.id,
-                                                     command: profile.renewalCommand)
-                }
-                .store(in: &cancellables)
+            // fact; nothing here retries. The warning stays until this profile
+            // is renewed or its stored token is replaced — a reading from the
+            // token that failed, still good for its last few minutes, proves
+            // nothing, and that token is never launched for again.
+            refresher.warn(through: { [weak self] in self?.store },
+                           providerID: provider.id, command: profile.renewalCommand)
 
             refresher.start()
         }

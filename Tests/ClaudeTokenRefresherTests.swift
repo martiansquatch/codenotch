@@ -566,3 +566,161 @@ final class ClaudeTokenRefresherEveryProfileTests: XCTestCase {
         XCTAssertTrue(ClaudeTokenRefresher.launchedPIDs(of: box.all).isEmpty)
     }
 }
+
+/// A Claude renewal failure stands until it is resolved, as a Codex one does.
+///
+/// Renewal runs in the last four minutes, so the token a failure was recorded
+/// against still answers a reading or two afterwards — and is never launched
+/// for again. Simulated sign-ins only: nothing touches the keychain or runs
+/// `claude`.
+@MainActor
+final class ClaudeTokenRefresherFailureTests: XCTestCase {
+    private let now = Date(timeIntervalSince1970: 1_700_000_000)
+    private typealias StoredToken = ClaudeTokenRefresher.StoredToken
+
+    /// One profile's sign-in: what the keychain holds, and the copy the
+    /// usage provider last read, which lags behind until something re-reads.
+    private final class SignIn {
+        var stored: StoredToken?
+        var held: StoredToken?
+        var launches = 0
+        /// What a launch leaves stored; nil leaves it as it was (a failure).
+        var renewsTo: StoredToken?
+        init(_ token: StoredToken) { stored = token; held = token }
+    }
+
+    private func token(_ expiry: Date, _ secret: String) -> StoredToken {
+        StoredToken(expiry: expiry, accessToken: secret)
+    }
+
+    private func refresher(_ signIn: SignIn) -> ClaudeTokenRefresher {
+        ClaudeTokenRefresher(
+            token: { signIn.held },
+            reload: { signIn.held = signIn.stored; return signIn.stored },
+            cli: URL(fileURLWithPath: "/opt/homebrew/bin/claude"),
+            launcher: { _, _ in
+                signIn.launches += 1
+                if let renewed = signIn.renewsTo { signIn.stored = renewed }
+                return (4242, { 1 })
+            })
+    }
+
+    /// A failure is reported once and stays reported: a later tick on the same
+    /// token neither retries nor recovers it, and neither does a look prompted
+    /// by a reading.
+    func testAFailureIsNotRecoveredWhileTheTokenIsUnchanged() async {
+        let signIn = SignIn(token(now.addingTimeInterval(60), "first"))
+        var failures = 0
+        var recoveries = 0
+        let refresher = refresher(signIn)
+        refresher.onFailure = { failures += 1 }
+        refresher.onRecovery = { recoveries += 1 }
+
+        await refresher.considerRenewing(now: now)
+        await refresher.considerRenewing(now: now.addingTimeInterval(3600))
+        await refresher.noticeReplacedToken()
+
+        XCTAssertEqual(failures, 1)
+        XCTAssertEqual(recoveries, 0)
+        XCTAssertEqual(signIn.launches, 1)
+    }
+
+    /// A different token with the very same expiry is a replacement: the
+    /// failure is recovered, and the one-attempt memory, kept by expiry, is
+    /// dropped with it — otherwise this token would never be tried. The
+    /// ten-minute cooldown between launches still applies.
+    func testAReplacedTokenWithTheSameExpiryRecoversAndIsRenewedInItsTurn() async {
+        let expiry = now.addingTimeInterval(60)
+        let signIn = SignIn(token(expiry, "first"))
+        var recoveries = 0
+        let refresher = refresher(signIn)
+        refresher.onRecovery = { recoveries += 1 }
+
+        await refresher.considerRenewing(now: now)
+        signIn.stored = token(expiry, "signed in again")
+        signIn.held = signIn.stored
+        await refresher.considerRenewing(now: now.addingTimeInterval(11 * 60))
+
+        XCTAssertEqual(recoveries, 1)
+        XCTAssertEqual(signIn.launches, 2, "the new token is due too, and is tried once")
+        guard case .failed = refresher.outcome else {
+            return XCTFail("the new token's own attempt did not move it either, got \(refresher.outcome)")
+        }
+    }
+
+    /// A reading prompts a look at what is stored, not at the provider's held
+    /// copy: while Claude Desktop's cache or `claude /usage` serves readings,
+    /// nothing else re-reads the keychain, and a fix made by hand would never
+    /// be seen.
+    func testALookPromptedByAReadingSeesPastTheHeldCopy() async {
+        let signIn = SignIn(token(now.addingTimeInterval(60), "first"))
+        var recoveries = 0
+        let refresher = refresher(signIn)
+        refresher.onRecovery = { recoveries += 1 }
+        await refresher.considerRenewing(now: now)
+
+        let renewed = now.addingTimeInterval(8 * 3600)
+        signIn.stored = token(renewed, "ran claude")       // the keychain only
+        await refresher.considerRenewing(now: now.addingTimeInterval(60))
+        XCTAssertEqual(recoveries, 0, "the held copy has not changed, so the tick cannot tell")
+
+        await refresher.noticeReplacedToken()
+        XCTAssertEqual(recoveries, 1)
+        XCTAssertEqual(refresher.outcome, .replaced(until: renewed))
+    }
+
+    /// Nothing read is not a replacement: a refused or transient keychain
+    /// read leaves the failure standing.
+    func testNothingReadIsNotAReplacement() async {
+        let signIn = SignIn(token(now.addingTimeInterval(60), "first"))
+        var recoveries = 0
+        let refresher = refresher(signIn)
+        refresher.onRecovery = { recoveries += 1 }
+        await refresher.considerRenewing(now: now)
+
+        signIn.stored = nil
+        signIn.held = nil
+        await refresher.noticeReplacedToken()
+        await refresher.considerRenewing(now: now.addingTimeInterval(3600))
+
+        XCTAssertEqual(recoveries, 0)
+        XCTAssertEqual(signIn.launches, 1)
+    }
+
+    /// A renewal that moves the expiry recovers — and without a failure
+    /// standing, a look prompted by a reading reads nothing at all.
+    func testARenewalRecoversAndALookWithNothingStandingReadsNothing() async {
+        let signIn = SignIn(token(now.addingTimeInterval(60), "first"))
+        signIn.renewsTo = token(now.addingTimeInterval(8 * 3600), "renewed")
+        var recoveries = 0
+        var rechecks = 0
+        let refresher = ClaudeTokenRefresher(
+            token: { signIn.held },
+            reload: { signIn.held = signIn.stored; return signIn.stored },
+            recheck: { rechecks += 1; return signIn.stored },
+            cli: URL(fileURLWithPath: "/opt/homebrew/bin/claude"),
+            launcher: { _, _ in
+                if let renewed = signIn.renewsTo { signIn.stored = renewed }
+                return (4242, { 1 })
+            })
+        refresher.onRecovery = { recoveries += 1 }
+
+        await refresher.considerRenewing(now: now)
+        await refresher.noticeReplacedToken()
+
+        XCTAssertEqual(refresher.outcome, .refreshed(until: now.addingTimeInterval(8 * 3600)))
+        XCTAssertEqual(recoveries, 1)
+        XCTAssertEqual(rechecks, 0, "no failure stands, so the keychain is left alone")
+    }
+
+    /// What is remembered about a stored token is a digest, never the token.
+    func testTheStoredTokenIsFingerprintedNotKept() {
+        let secret = "sk-ant-oat01-not-a-real-token"
+        let stored = token(now, secret)
+        XCTAssertEqual(stored.fingerprint?.count, 64)
+        XCTAssertNotEqual(stored.fingerprint, secret)
+        XCTAssertFalse(stored.fingerprint?.contains(secret) ?? true)
+        XCTAssertEqual(stored, token(now, secret), "the same token, the same digest")
+        XCTAssertNotEqual(stored, token(now, secret + "x"), "a different token, a different one")
+    }
+}

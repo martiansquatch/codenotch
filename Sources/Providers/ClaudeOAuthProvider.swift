@@ -42,7 +42,25 @@ actor ClaudeOAuthProvider: UsageProvider {
     /// long is left *before* deciding to do anything. Kept here because this is
     /// already the one place that reads the item, so exposing it costs no extra
     /// keychain traffic and no extra prompt.
-    private(set) var tokenExpiry: Date?
+    var tokenExpiry: Date? { storedToken?.expiry }
+    /// The same read, as the refresher identifies it: the expiry and a
+    /// SHA-256 digest of the access token, taken from the one keychain read
+    /// that produced both. Only the digest leaves this actor.
+    ///
+    /// Every profile's token is a keychain item — the default one under
+    /// `Claude Code-credentials`, every other profile under its own suffixed
+    /// name (`ClaudeProfile.keychainServices`); Claude Code on a Mac writes no
+    /// `.credentials.json` in a `CLAUDE_CONFIG_DIR`. So wherever there is an
+    /// expiry there is a fingerprint: both come out of the same document, and
+    /// a read that cannot be made without a prompt yields neither.
+    private(set) var storedToken: ClaudeTokenRefresher.StoredToken?
+    /// The keychain item's modification date as of the last `recheckStoredToken`.
+    private var recheckedStamp: Date?
+    /// When the owning app last wrote this profile's item. Attributes only:
+    /// no data is read and nothing can prompt. Injected for the same reason
+    /// `loadCredentials` is; a test that stands in for the credential gets
+    /// no probe, so it never looks at the developer's own keychain.
+    private let itemModifiedAt: @Sendable () -> Date?
     /// Set when the endpoint returns 429. Until it passes, refreshes are
     /// skipped without touching the network — a poll that keeps firing into a
     /// rate limit is how you stay rate limited.
@@ -139,6 +157,7 @@ actor ClaudeOAuthProvider: UsageProvider {
          session: URLSession = .shared,
          archive: UsageArchive = UsageArchive(),
          loadCredentials: (@Sendable () throws -> ClaudeCredentials)? = nil,
+         itemModifiedAt: (@Sendable () -> Date?)? = nil,
          cli: ClaudeUsageCLI? = ClaudeUsageCLI.locate(),
          cliRefreshInterval: TimeInterval = 5 * 60,
          liveCLIRefreshInterval: TimeInterval = 90,
@@ -163,6 +182,14 @@ actor ClaudeOAuthProvider: UsageProvider {
         let keychain = ClaudeKeychain(profile: profile)
         self.keychain = keychain
         self.loadCredentials = loadCredentials ?? { try keychain.load() }
+        if let itemModifiedAt {
+            self.itemModifiedAt = itemModifiedAt
+        } else if loadCredentials == nil {
+            let services = keychain.services
+            self.itemModifiedAt = { KeychainItem.modifiedAt(services: services) }
+        } else {
+            self.itemModifiedAt = { nil }
+        }
         self.session = session
         self.archive = archive
         // Pick the back-off back up where the last run left it, so relaunching
@@ -554,7 +581,7 @@ actor ClaudeOAuthProvider: UsageProvider {
         // own window never expired and the keychain was never read again.
         let fresh = try loadCredentials()
         Log.usage.debug("\(self.id, privacy: .public): read keychain token, expires \(fresh.expiresAt, privacy: .public)")
-        tokenExpiry = fresh.expiresAt
+        storedToken = Self.storedToken(of: fresh)
         // Expired is not signed out. Claude Code rotates this token whenever it
         // runs, and this app deliberately does not — minting one would mean
         // writing a credential it does not own, and racing the owner for it. So
@@ -615,11 +642,43 @@ actor ClaudeOAuthProvider: UsageProvider {
     /// should want it: everything else is served from the cache precisely so
     /// that the keychain — and its prompt — is touched as rarely as possible.
     func reloadTokenExpiry() -> Date? {
+        reloadStoredToken()?.expiry
+    }
+
+    /// The same after-check, reporting the whole stored sign-in.
+    func reloadStoredToken() -> ClaudeTokenRefresher.StoredToken? {
         keychain.forgetCached()
         credentials = nil
         guard let fresh = try? loadCredentials() else { return nil }
-        tokenExpiry = fresh.expiresAt
-        return fresh.expiresAt
+        storedToken = Self.storedToken(of: fresh)
+        return storedToken
+    }
+
+    /// What is stored now, for a renewal failure that is still standing when a
+    /// reading comes back. Reloads only when the keychain item was written
+    /// since the last look — the attribute probe is free, the data read is
+    /// what `CredentialCache` exists to ration — so a standing warning costs
+    /// one read, then one per rotation, not one per poll. With no probe (no
+    /// item found, or a test) it reloads, which with no item reads nothing.
+    /// Never interactive: a read that would need a prompt finds nothing, and
+    /// nothing read is never taken for a replacement.
+    ///
+    /// The held copy cannot answer this on its own: while Claude Desktop's
+    /// cache or `claude /usage` is serving readings, nothing here re-reads
+    /// the keychain, so a token the user replaced would never be seen.
+    func recheckStoredToken() -> ClaudeTokenRefresher.StoredToken? {
+        let stamp = itemModifiedAt()
+        if let stamp, stamp == recheckedStamp { return storedToken }
+        // Noted only once a read went through: a transient refusal (dark
+        // wake) must not have this version of the item passed over for good.
+        guard let fresh = reloadStoredToken() else { return nil }
+        recheckedStamp = stamp
+        return fresh
+    }
+
+    private static func storedToken(of credentials: ClaudeCredentials) -> ClaudeTokenRefresher.StoredToken {
+        ClaudeTokenRefresher.StoredToken(expiry: credentials.expiresAt,
+                                         accessToken: credentials.accessToken)
     }
 
     nonisolated func account() -> ProviderAccount? {

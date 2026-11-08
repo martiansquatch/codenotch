@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 /// Keeps the Claude OAuth token in the login keychain from ageing out.
@@ -24,6 +25,14 @@ import Foundation
 /// prompt, a version that started accepting empty input could not be talked
 /// into answering one by accident — the failure mode is a wasted launch, never
 /// an invented conversation.
+///
+/// A failure stays reported until it is actually resolved: a renewal here
+/// moves the expiry, or the profile's stored token is replaced (the user ran
+/// the command). Renewal runs in the last four minutes, so the token a failure
+/// was recorded against can still answer a reading or two — and since it is
+/// never launched for again, clearing the warning on such a reading left
+/// nothing to raise it when that token died. The same rule as
+/// `CodexTokenRefresher`, which tries a day ahead and so hit it first.
 @MainActor
 final class ClaudeTokenRefresher: ObservableObject {
     enum Outcome: Equatable {
@@ -32,6 +41,37 @@ final class ClaudeTokenRefresher: ObservableObject {
         /// Ran, or could not be run, and the token is still going to expire.
         /// The string is what the user should be told.
         case failed(String)
+        /// The token a failure was recorded against is no longer the one
+        /// stored: it was renewed or signed in again outside Codenotch.
+        case replaced(until: Date)
+    }
+
+    /// What identifies one stored sign-in: its expiry, and a digest of the
+    /// access token so a replacement is noticed even if the expiry happened to
+    /// match. The token itself is never kept. Shared with
+    /// `CodexTokenRefresher`, which judges its sign-ins the same way.
+    ///
+    /// A nil fingerprint is a sign-in known only by its expiry; two of those
+    /// differ only when the expiry does.
+    struct StoredToken: Equatable, Sendable {
+        let expiry: Date
+        let fingerprint: String?
+
+        init(expiry: Date, fingerprint: String?) {
+            self.expiry = expiry
+            self.fingerprint = fingerprint
+        }
+
+        /// Digests `accessToken` on the spot; only the digest is kept.
+        init(expiry: Date, accessToken: String) {
+            self.init(expiry: expiry, fingerprint: Self.fingerprint(of: accessToken))
+        }
+
+        /// SHA-256 of the token, hex. Enough to tell two tokens apart, and
+        /// useless for anything else.
+        static func fingerprint(of accessToken: String) -> String {
+            SHA256.hash(data: Data(accessToken.utf8)).map { String(format: "%02x", $0) }.joined()
+        }
     }
 
     /// A started command: its pid, known synchronously so the session monitor
@@ -66,11 +106,15 @@ final class ClaudeTokenRefresher: ObservableObject {
     /// Claude Code files the default token under a different keychain name
     /// than an explicitly named directory.
     let configDirectory: URL?
-    /// The token's expiry as the usage provider last read it. Cheap: it is the
-    /// value already in hand, so asking costs no keychain traffic and no prompt.
-    private let expiry: @MainActor () async -> Date?
+    /// The token as the usage provider last read it. Cheap: it is the value
+    /// already in hand, so asking costs no keychain traffic and no prompt.
+    private let token: @MainActor () async -> StoredToken?
     /// Drop the held copy and read the keychain again — the after-check.
-    private let reload: @MainActor () async -> Date?
+    private let reload: @MainActor () async -> StoredToken?
+    /// Look at what is stored now, for a failure standing when a reading comes
+    /// back. Re-reads only when the stored item changed; see
+    /// `ClaudeOAuthProvider.recheckStoredToken`.
+    private let recheck: @MainActor () async -> StoredToken?
 
     private var timer: Timer?
     private var isRunning = false
@@ -83,8 +127,22 @@ final class ClaudeTokenRefresher: ObservableObject {
     /// is what makes a failure stop instead of looping: a token that did not
     /// renew has the same expiry next tick, and is refused.
     private var attemptedFor: Date?
+    /// The stored token a failure was reported against. The failure stands
+    /// until this profile is renewed here or holds a different token; a
+    /// reading coming back clears nothing.
+    private var failedOn: StoredToken?
+    /// Told each time a renewal fails. `warn(through:providerID:command:)`
+    /// points it at `UsageStore.reportRenewalFailed`, which raises the
+    /// Settings warning.
+    var onFailure: (@MainActor () -> Void)?
+    /// Told when a failure no longer stands: a renewal here moved the expiry,
+    /// or the stored token is a different one. The only thing that should
+    /// take the warning `onFailure` raised away.
+    var onRecovery: (@MainActor () -> Void)?
 
-    init(
+    /// The tests' shorthand: a token known only by its expiry, with a reading
+    /// re-checked by reloading. The app passes the provider's full sign-in.
+    convenience init(
         expiry: @escaping @MainActor () async -> Date?,
         reload: @escaping @MainActor () async -> Date?,
         cli: URL? = ClaudeCLI.standalone(),
@@ -95,8 +153,27 @@ final class ClaudeTokenRefresher: ObservableObject {
         configDirectory: URL? = nil,
         launcher: Launcher? = nil
     ) {
-        self.expiry = expiry
+        self.init(token: { await expiry().map { StoredToken(expiry: $0, fingerprint: nil) } },
+                  reload: { await reload().map { StoredToken(expiry: $0, fingerprint: nil) } },
+                  cli: cli, margin: margin, cooldown: cooldown, timeout: timeout,
+                  interval: interval, configDirectory: configDirectory, launcher: launcher)
+    }
+
+    init(
+        token: @escaping @MainActor () async -> StoredToken?,
+        reload: @escaping @MainActor () async -> StoredToken?,
+        recheck: (@MainActor () async -> StoredToken?)? = nil,
+        cli: URL? = ClaudeCLI.standalone(),
+        margin: TimeInterval = 4 * 60,
+        cooldown: TimeInterval = 10 * 60,
+        timeout: TimeInterval = 30,
+        interval: TimeInterval = 60,
+        configDirectory: URL? = nil,
+        launcher: Launcher? = nil
+    ) {
+        self.token = token
         self.reload = reload
+        self.recheck = recheck ?? reload
         self.cli = cli
         self.margin = margin
         self.cooldown = cooldown
@@ -122,21 +199,37 @@ final class ClaudeTokenRefresher: ObservableObject {
     /// profile; left nil, each refresher runs the real one.
     static func forEveryProfile(
         _ profiles: [ClaudeProfile],
-        expiry: @escaping @MainActor (ClaudeProfile) async -> Date?,
-        reload: @escaping @MainActor (ClaudeProfile) async -> Date?,
+        token: @escaping @MainActor (ClaudeProfile) async -> StoredToken?,
+        reload: @escaping @MainActor (ClaudeProfile) async -> StoredToken?,
+        recheck: (@MainActor (ClaudeProfile) async -> StoredToken?)? = nil,
         cli: URL? = ClaudeCLI.standalone(),
         launcher: ((ClaudeProfile) -> Launcher)? = nil
     ) -> [(profile: ClaudeProfile, refresher: ClaudeTokenRefresher)] {
         profiles.map { profile in
             let refresher = ClaudeTokenRefresher(
-                expiry: { await expiry(profile) },
+                token: { await token(profile) },
                 reload: { await reload(profile) },
+                recheck: recheck.map { recheck in { await recheck(profile) } },
                 cli: cli,
                 configDirectory: profile.slug == nil ? nil : profile.configDirectory,
                 launcher: launcher?(profile)
             )
             return (profile, refresher)
         }
+    }
+
+    /// The tests' shorthand: every profile's token known only by its expiry.
+    static func forEveryProfile(
+        _ profiles: [ClaudeProfile],
+        expiry: @escaping @MainActor (ClaudeProfile) async -> Date?,
+        reload: @escaping @MainActor (ClaudeProfile) async -> Date?,
+        cli: URL? = ClaudeCLI.standalone(),
+        launcher: ((ClaudeProfile) -> Launcher)? = nil
+    ) -> [(profile: ClaudeProfile, refresher: ClaudeTokenRefresher)] {
+        forEveryProfile(profiles,
+                        token: { await expiry($0).map { StoredToken(expiry: $0, fingerprint: nil) } },
+                        reload: { await reload($0).map { StoredToken(expiry: $0, fingerprint: nil) } },
+                        cli: cli, launcher: launcher)
     }
 
     /// Every pid any of these refreshers has running right now — what the
@@ -197,24 +290,27 @@ final class ClaudeTokenRefresher: ObservableObject {
         // most one launch" true unconditionally, and it can only do that by
         // being set before the first `await` — set any later and a second
         // overlapping call reaches this same guard while `isRunning` is still
-        // false, exactly as `expiry()` below is what it would be waiting on.
+        // false, exactly as `token()` below is what it would be waiting on.
         guard !isRunning else { return }
         isRunning = true
         defer { isRunning = false; launchedPID = nil }
 
-        let current = await expiry()
-        guard Self.shouldRenew(expiry: current, now: now, margin: margin,
+        let stored = await token()
+        noticeReplacement(of: stored)
+        guard Self.shouldRenew(expiry: stored?.expiry, now: now, margin: margin,
                                attemptedFor: attemptedFor, lastAttempt: lastAttempt,
                                cooldown: cooldown),
-              let current
+              let stored
         else { return }
+        let current = stored.expiry
 
         lastAttempt = now
         attemptedFor = current
 
         let remaining = current.timeIntervalSince(now)
         guard let cli else {
-            fail("Claude's saved login is about to expire and the `claude` command "
+            fail(on: stored,
+                 "Claude's saved login is about to expire and the `claude` command "
                + "isn't installed to renew it. Run Claude Code once to sign in again.")
             return
         }
@@ -226,25 +322,77 @@ final class ClaudeTokenRefresher: ObservableObject {
             launchedPID = pid          // synchronously, before it can be scanned
             status = await exit()
         } catch {
-            fail("Couldn't run `claude` to renew Claude's saved login.")
+            fail(on: stored, "Couldn't run `claude` to renew Claude's saved login.")
             Log.usage.error("token renewal could not start: \(String(describing: error), privacy: .public)")
             return
         }
 
         // Judged on the outcome, never on the exit status: refusing an empty
         // prompt is a *non-zero* exit and a successful renewal at the same time.
-        let after = await reload()
-        guard let after, after > current else {
-            fail("Claude usage needs its sign-in renewed — run `claude` once in a terminal.")
-            Log.usage.error("token renewal ran (exit \(status ?? -1)) but the expiry did not move; still \(String(describing: after), privacy: .public)")
+        let reloaded = await reload()
+        guard let after = reloaded?.expiry, after > current else {
+            // Against what is stored now, where the after-check read it: that
+            // is what a later look will be compared with.
+            fail(on: reloaded ?? stored,
+                 "Claude usage needs its sign-in renewed — run `claude` once in a terminal.")
+            Log.usage.error("token renewal ran (exit \(status ?? -1)) but the expiry did not move; still \(String(describing: reloaded?.expiry), privacy: .public)")
             return
         }
         outcome = .refreshed(until: after)
         Log.usage.notice("claude token renewed, now expires \(after, privacy: .public)")
+        recover()
     }
 
-    private func fail(_ message: String) {
+    /// Looks at the stored token and clears a standing failure if it was
+    /// replaced. Called when a usage reading comes back while a failure
+    /// stands, so a fix made by hand is noticed within a polling pass rather
+    /// than at the next tick. Reads nothing when no failure stands.
+    func noticeReplacedToken() async {
+        guard failedOn != nil else { return }
+        noticeReplacement(of: await recheck())
+    }
+
+    /// A failure is about one token. Once a different one is stored, the
+    /// failure no longer describes anything — and the one-attempt memory goes
+    /// with it, so the new token is renewed in its turn like any other.
+    /// Nothing read (no item, a refused or transient read) is not a
+    /// replacement.
+    private func noticeReplacement(of token: StoredToken?) {
+        guard let failed = failedOn, let token, token != failed else { return }
+        attemptedFor = nil
+        outcome = .replaced(until: token.expiry)
+        let whose = configDirectory?.path ?? "the default profile"
+        Log.usage.notice("claude token for \(whose, privacy: .public) was replaced, now expires \(token.expiry, privacy: .public)")
+        recover()
+    }
+
+    private func fail(on token: StoredToken?, _ message: String) {
         outcome = .failed(message)
+        if let token { failedOn = token }
+        onFailure?()
+    }
+
+    private func recover() {
+        failedOn = nil
+        onRecovery?()
+    }
+
+    /// Shows this profile's failures as a Settings warning in `store`, held
+    /// until this refresher says the profile recovered. A usage reading
+    /// coming back only prompts a look at the stored token; on its own it
+    /// clears nothing. `store` is a getter so AppDelegate can pass its
+    /// optional one.
+    func warn(through store: @escaping @MainActor () -> UsageStore?,
+              providerID: String, command: String) {
+        onFailure = { [weak self] in
+            store()?.reportRenewalFailed(providerID: providerID, command: command,
+                                         recheck: { [weak self] in
+                                             await self?.noticeReplacedToken()
+                                         })
+        }
+        onRecovery = {
+            store()?.reportRenewalRecovered(providerID: providerID)
+        }
     }
 
     // MARK: - Running it

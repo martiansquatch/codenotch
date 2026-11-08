@@ -162,6 +162,73 @@ final class ClaudeOAuthProviderTests: XCTestCase {
         XCTAssertEqual(StubEndpoint.requestCount, 2)
     }
 
+    // MARK: - The stored sign-in, as the token refresher sees it
+
+    /// The refresher is handed a digest of the token, from the same read as
+    /// its expiry — never the token.
+    func testTheStoredTokenIsADigestOfTheToken() async throws {
+        let source = CredentialSource(readable: true)
+        let provider = makeProvider(source: source)
+
+        let reloaded = await provider.reloadStoredToken()
+        let stored = try XCTUnwrap(reloaded)
+
+        XCTAssertEqual(stored.fingerprint, ClaudeTokenRefresher.StoredToken.fingerprint(of: "token"))
+        XCTAssertEqual(stored.fingerprint?.count, 64)
+        XCTAssertNotEqual(stored.fingerprint, "token")
+        XCTAssertEqual(stored.expiry, .distantFuture)
+        let held = await provider.storedToken
+        let expiry = await provider.tokenExpiry
+        XCTAssertEqual(held, stored)
+        XCTAssertEqual(expiry, .distantFuture)
+    }
+
+    /// A look for a replaced token reads the keychain once, then only when
+    /// the item has been written since — the attribute probe is free, the
+    /// data read is not.
+    func testARecheckReadsTheKeychainOnlyWhenTheItemChanged() async throws {
+        let source = CredentialSource(readable: true)
+        let stamp = Stamp(Date(timeIntervalSince1970: 1_000))
+        let provider = makeProvider(source: source, itemModifiedAt: { stamp.value })
+
+        let first = await provider.recheckStoredToken()
+        let again = await provider.recheckStoredToken()
+        XCTAssertEqual(source.reads, 1, "nothing moved, nothing read")
+        XCTAssertEqual(again, first)
+
+        source.setToken("new-token")
+        stamp.value = Date(timeIntervalSince1970: 2_000)
+        let replaced = await provider.recheckStoredToken()
+        XCTAssertEqual(source.reads, 2)
+        XCTAssertEqual(replaced?.fingerprint, ClaudeTokenRefresher.StoredToken.fingerprint(of: "new-token"))
+    }
+
+    /// A read that fails is not taken as having looked at that version of the
+    /// item: a moment of dark wake must not hide a replacement for good.
+    func testARecheckThatCouldNotReadTriesAgain() async throws {
+        let source = CredentialSource(readable: false)
+        let stamp = Stamp(Date(timeIntervalSince1970: 1_000))
+        let provider = makeProvider(source: source, itemModifiedAt: { stamp.value })
+
+        let failed = await provider.recheckStoredToken()
+        XCTAssertNil(failed)
+        source.makeReadable()
+        let read = await provider.recheckStoredToken()
+
+        XCTAssertEqual(source.reads, 2)
+        XCTAssertNotNil(read)
+    }
+
+    private final class Stamp: @unchecked Sendable {
+        private let lock = NSLock()
+        private var stored: Date?
+        init(_ value: Date?) { stored = value }
+        var value: Date? {
+            get { lock.lock(); defer { lock.unlock() }; return stored }
+            set { lock.lock(); stored = newValue; lock.unlock() }
+        }
+    }
+
     func testEndpointCacheIsPerProvider() async throws {
         StubEndpoint.reset(Array(repeating: .init(status: 200, body: Self.usagePayload), count: 2))
         let first = makeProvider(source: CredentialSource(readable: true), endpointIntervals: (300, 120))
@@ -274,7 +341,8 @@ final class ClaudeOAuthProviderTests: XCTestCase {
                               desktopFreshness: TimeInterval = 30 * 60,
                               liveDesktopFreshness: TimeInterval = 2 * 60,
                               desktopRescanInterval: TimeInterval = 5 * 60,
-                              endpointIntervals: (standard: TimeInterval, live: TimeInterval) = (0, 0)) -> ClaudeOAuthProvider {
+                              endpointIntervals: (standard: TimeInterval, live: TimeInterval) = (0, 0),
+                              itemModifiedAt: (@Sendable () -> Date?)? = nil) -> ClaudeOAuthProvider {
         // A private defaults suite per test: the archive persists the 429 back-off
         // deadline, and a leaked one would silently skip fetches in the next test.
         let name = "ClaudeOAuthProviderTests.\(UUID().uuidString)"
@@ -295,6 +363,7 @@ final class ClaudeOAuthProviderTests: XCTestCase {
                                    session: StubEndpoint.session(),
                                    archive: UsageArchive(defaults: defaults),
                                    loadCredentials: { try source.read() },
+                                   itemModifiedAt: itemModifiedAt,
                                    cli: cli,
                                    cliRefreshInterval: cliRefreshInterval,
                                    liveCLIRefreshInterval: liveCLIRefreshInterval,

@@ -30,10 +30,11 @@ final class UsageStore: ObservableObject {
     @Published private(set) var needsRenewal: [String: String] = [:]
     /// Warnings a usage reading does not clear, keyed by provider id, with what
     /// to call when a reading comes back so their owner can check whether the
-    /// stored login was replaced. Codex: renewal starts a day before expiry, so
-    /// after a failure the old token keeps working for hours, and a reading
-    /// coming back says nothing about whether it will be renewed.
-    private var renewalRechecks: [String: @MainActor () -> Void] = [:]
+    /// stored login was replaced. After a failed renewal the old token keeps
+    /// working for a while — hours for Codex, tried a day ahead; minutes for
+    /// Claude, tried four ahead — and a reading coming back says nothing about
+    /// whether it will be renewed: the refresher never tries that token again.
+    private var renewalRechecks: [String: @MainActor () async -> Void] = [:]
     /// Bumped when a provider's authentication state changes. Settings listens
     /// to this separately from usage snapshots so it can re-read account
     /// summaries without re-reading every credential on every polling pass.
@@ -771,13 +772,14 @@ final class UsageStore: ObservableObject {
 
     /// The same warning, held until `reportRenewalRecovered` takes it away.
     ///
-    /// For a renewal attempted long before expiry (Codex, a day ahead): the old
-    /// token still works afterwards, so a usage reading coming back is no
-    /// evidence the problem went away, and clearing on one hid it until the
-    /// token died. A reading only calls `recheck`, which lets the owner look
-    /// at the stored token and report recovery if it was replaced.
+    /// What both refreshers report through. A renewal is attempted before
+    /// expiry (Codex a day ahead, Claude four minutes), so the old token still
+    /// works afterwards; a usage reading coming back is no evidence the
+    /// problem went away, and clearing on one hid it until the token died. A
+    /// reading only calls `recheck`, which lets the owner look at the stored
+    /// token and report recovery if it was replaced.
     func reportRenewalFailed(providerID: String, command: String,
-                             recheck: @escaping @MainActor () -> Void) {
+                             recheck: @escaping @MainActor () async -> Void) {
         renewalRechecks[providerID] = recheck
         reportRenewalFailed(providerID: providerID, command: command)
     }
@@ -870,14 +872,14 @@ final class UsageStore: ObservableObject {
                 archive.save(lastGood)
             }
             refusedAccess.remove(provider.id)
-            // A reading that actually came back is proof the credential works,
-            // whatever was thought a moment ago — for a renewal tried minutes
-            // before expiry (Claude), where nothing else could be serving it.
-            // A warning held for confirmation (Codex, tried a day ahead) is
-            // not cleared by a reading: the old token still works for hours.
-            // The reading only prompts its owner to look at the stored token.
+            // A held warning (both refreshers report through one) is not
+            // cleared by a reading: the token that failed to renew still works
+            // until it expires, and is never tried again. The reading only
+            // prompts its owner to look at the stored token. A warning
+            // reported without a recheck still clears on any reading.
+            // Awaited, so the look is over by the time this reading lands.
             if let recheck = renewalRechecks[provider.id] {
-                recheck()
+                await recheck()
             } else {
                 needsRenewal.removeValue(forKey: provider.id)
             }

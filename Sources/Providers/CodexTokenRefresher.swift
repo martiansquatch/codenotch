@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 
 /// Keeps every Codex profile's `auth.json` from ageing out.
@@ -35,11 +34,9 @@ final class CodexTokenRefresher {
 
     /// What identifies one stored sign-in: its expiry, and a digest of the
     /// access token so a replacement is noticed even if the expiry happened to
-    /// match. The token itself is never kept.
-    struct StoredToken: Equatable {
-        let expiry: Date
-        let fingerprint: String?
-    }
+    /// match. The token itself is never kept. The same type Claude's sign-ins
+    /// are judged by.
+    typealias StoredToken = ClaudeTokenRefresher.StoredToken
 
     /// Starts the app server for one profile, asks it to refresh, and returns
     /// once `done` says the expiry moved or the timeout passed. Injected so
@@ -163,9 +160,8 @@ final class CodexTokenRefresher {
         guard let auth = try? JSONDecoder().decode(Auth.self, from: data),
               let exp = CodexCredentials.claims(inJWT: auth.tokens.access_token)?["exp"] as? Double
         else { return nil }
-        let digest = SHA256.hash(data: Data(auth.tokens.access_token.utf8))
         return StoredToken(expiry: Date(timeIntervalSince1970: exp),
-                           fingerprint: digest.map { String(format: "%02x", $0) }.joined())
+                           accessToken: auth.tokens.access_token)
     }
 
     func renewDue(now: Date = Date()) async {

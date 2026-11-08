@@ -92,9 +92,9 @@ final class RenewalWarningTests: XCTestCase {
 
     // MARK: - Disappearance
 
-    /// A reading that came back is proof the credential works, whatever was
-    /// believed a moment ago. This is the only thing that clears the warning —
-    /// no timer, and nothing retries on its own.
+    /// A warning reported without a recheck clears on a reading that came
+    /// back — no timer, and nothing retries on its own. Both refreshers report
+    /// with one, so theirs is held instead; see the sections below.
     func testItClearsOnceAReadingComesBack() async {
         let provider = Provider()
         let store = store(provider)
@@ -366,5 +366,190 @@ final class RenewalWarningTests: XCTestCase {
         XCTAssertEqual(setup.launches(), 2, "the new token is not blocked by the old one's attempt")
         XCTAssertTrue(codexWarning(setup, setup.stuck), "and its own failure is reported")
         XCTAssertFalse(codexWarning(setup, setup.healthy))
+    }
+
+    // MARK: - A Claude warning stays until it is resolved
+
+    /// Claude renewal runs in the last four minutes, so after a failure the
+    /// old token still answers a reading or two, and is never launched for
+    /// again. Clearing the warning on such a reading left nothing to raise it
+    /// when the token died. Simulated sign-ins: what the keychain holds, and
+    /// the copy the usage provider last read. Nothing touches the keychain or
+    /// runs `claude`.
+    private typealias StoredToken = ClaudeTokenRefresher.StoredToken
+
+    private final class ClaudeSignIns {
+        /// What each profile's keychain item holds.
+        var stored: [String: StoredToken] = [:]
+        /// What the usage provider last read; lags until something re-reads.
+        var held: [String: StoredToken] = [:]
+        var launches: [String] = []
+        /// What the stand-in for `claude` does to a profile's stored token.
+        var renew: (ClaudeProfile) -> Void = { _ in }
+    }
+
+    private struct ClaudeSetup {
+        let store: UsageStore
+        let pairs: [(profile: ClaudeProfile, refresher: ClaudeTokenRefresher)]
+        let healthy: ClaudeProfile
+        let stuck: ClaudeProfile
+        let signIns: ClaudeSignIns
+
+        var refresher: ClaudeTokenRefresher { pairs.first { $0.profile == stuck }!.refresher }
+
+        /// One timer tick, every profile.
+        func tick(_ at: Date) async {
+            for pair in pairs { await pair.refresher.considerRenewing(now: at) }
+        }
+    }
+
+    private func claudeToken(_ expiry: Date, _ secret: String) -> StoredToken {
+        StoredToken(expiry: expiry, accessToken: secret)
+    }
+
+    /// A healthy default profile and a second one a minute from expiry, wired
+    /// to the store the way AppDelegate wires them.
+    private func claudeSetup() -> ClaudeSetup {
+        let home = URL(fileURLWithPath: "/Users/someone")
+        let healthy = ClaudeProfile.default(home: home)
+        let stuck = ClaudeProfile(slug: "work", configDirectory: home.appendingPathComponent(".claude-work"))
+        let signIns = ClaudeSignIns()
+        signIns.stored = [healthy.id: claudeToken(now.addingTimeInterval(8 * 3600), "healthy"),
+                          stuck.id: claudeToken(now.addingTimeInterval(60), "stuck")]
+        signIns.held = signIns.stored
+        let store = store(Provider(id: healthy.id, displayName: "Claude"),
+                          Provider(id: stuck.id, displayName: "Claude (work)"))
+        let pairs = ClaudeTokenRefresher.forEveryProfile(
+            [healthy, stuck],
+            token: { signIns.held[$0.id] },
+            reload: { signIns.held[$0.id] = signIns.stored[$0.id]; return signIns.stored[$0.id] },
+            cli: URL(fileURLWithPath: "/opt/homebrew/bin/claude"),
+            launcher: { profile in
+                { _, _ in
+                    signIns.launches.append(profile.id)
+                    signIns.renew(profile)
+                    return (4242, { 1 })
+                }
+            })
+        for (profile, refresher) in pairs {
+            refresher.warn(through: { store }, providerID: profile.id, command: profile.renewalCommand)
+        }
+        return ClaudeSetup(store: store, pairs: pairs, healthy: healthy, stuck: stuck, signIns: signIns)
+    }
+
+    private func claudeWarning(_ setup: ClaudeSetup, _ profile: ClaudeProfile) -> Bool {
+        setup.store.providerSummaries.first { $0.id == profile.id }?.needsSignInRenewal ?? false
+    }
+
+    /// The regression: the old token still answers in its last minutes, a
+    /// reading comes back, and the warning must stay — on the failing
+    /// profile's row, naming its command.
+    func testAReadingDoesNotClearAClaudeWarning() async {
+        let setup = claudeSetup()
+        await setup.tick(now)
+        XCTAssertTrue(claudeWarning(setup, setup.stuck))
+
+        await setup.store.refresh()
+        await setup.store.refresh()
+        await setup.tick(now.addingTimeInterval(120))
+
+        XCTAssertTrue(claudeWarning(setup, setup.stuck), "a reading from the old token proves nothing")
+        XCTAssertEqual(setup.store.needsRenewal, [setup.stuck.id: setup.stuck.renewalCommand])
+        XCTAssertEqual(text(setup.store, setup.stuck.id),
+                       "Claude (work) usage needs its sign-in renewed — run "
+                       + "`\(setup.stuck.renewalCommand)` once in a terminal.")
+        XCTAssertFalse(claudeWarning(setup, setup.healthy), "the healthy profile never warns")
+        XCTAssertEqual(setup.signIns.launches, [setup.stuck.id], "and the stuck token is not retried")
+    }
+
+    /// The real way a held Claude warning ends in a renewal: nothing launches
+    /// for the failed token again, so the token has to change first, and the
+    /// change is what clears the warning — here noticed by a reading, since
+    /// the provider's held copy has not moved. The new token, when due, is
+    /// then renewed in its turn.
+    func testAHeldClaudeWarningClearsOnlyOnceTheTokenChanges() async {
+        let setup = claudeSetup()
+        let renewed = now.addingTimeInterval(8 * 3600)
+        var warnedAtLaunch: [Bool] = []
+        setup.signIns.renew = { profile in
+            warnedAtLaunch.append(self.claudeWarning(setup, profile))
+            if warnedAtLaunch.count > 1 { setup.signIns.stored[profile.id] = self.claudeToken(renewed, "renewed") }
+        }
+
+        await setup.tick(now)                               // a real failed attempt
+        guard case .failed = setup.refresher.outcome else {
+            return XCTFail("expected a real failure, got \(setup.refresher.outcome)")
+        }
+        await setup.store.refresh()
+        await setup.tick(now.addingTimeInterval(120))
+        XCTAssertTrue(claudeWarning(setup, setup.stuck))
+        XCTAssertEqual(setup.signIns.launches.count, 1, "the failed token is never launched for again")
+
+        // Signed in again; the new token is due as well.
+        setup.signIns.stored[setup.stuck.id] = claudeToken(now.addingTimeInterval(12 * 60), "signed in again")
+        await setup.store.refresh()
+        XCTAssertFalse(claudeWarning(setup, setup.stuck), "the changed token cleared it")
+        await setup.tick(now.addingTimeInterval(11 * 60))
+
+        XCTAssertEqual(setup.signIns.launches.count, 2, "the new token gets its own attempt")
+        XCTAssertEqual(warnedAtLaunch, [false, false])
+        XCTAssertEqual(setup.refresher.outcome, .refreshed(until: renewed))
+        XCTAssertFalse(claudeWarning(setup, setup.stuck))
+        XCTAssertTrue(setup.store.needsRenewal.isEmpty)
+    }
+
+    /// The user ran the command: the keychain now holds a different token.
+    /// The next reading notices, though the provider's held copy is the old
+    /// one, without waiting for the refresher's next tick.
+    func testATokenChangeInTheKeychainClearsAClaudeWarning() async {
+        let setup = claudeSetup()
+        await setup.tick(now)
+        await setup.store.refresh()
+        XCTAssertTrue(claudeWarning(setup, setup.stuck))
+
+        let renewed = now.addingTimeInterval(8 * 3600)
+        setup.signIns.stored[setup.stuck.id] = claudeToken(renewed, "ran claude")
+        await setup.store.refresh()
+
+        XCTAssertFalse(claudeWarning(setup, setup.stuck), "the replaced token took it away")
+        XCTAssertTrue(setup.store.needsRenewal.isEmpty)
+        XCTAssertEqual(setup.refresher.outcome, .replaced(until: renewed))
+        XCTAssertFalse(claudeWarning(setup, setup.healthy))
+    }
+
+    /// The refresher's own tick notices a replaced token too, with no reading,
+    /// once the provider has read it.
+    func testTheClaudeTickNoticesAReplacedToken() async {
+        let setup = claudeSetup()
+        await setup.tick(now)
+        XCTAssertTrue(claudeWarning(setup, setup.stuck))
+
+        let renewed = now.addingTimeInterval(8 * 3600)
+        setup.signIns.stored[setup.stuck.id] = claudeToken(renewed, "ran claude")
+        setup.signIns.held[setup.stuck.id] = setup.signIns.stored[setup.stuck.id]
+        await setup.tick(now.addingTimeInterval(120))
+
+        XCTAssertFalse(claudeWarning(setup, setup.stuck))
+        XCTAssertEqual(setup.refresher.outcome, .replaced(until: renewed))
+        XCTAssertEqual(setup.signIns.launches.count, 1, "a token with hours left is not launched for")
+    }
+
+    /// A different token with the very same expiry still counts as replaced,
+    /// and the one-attempt memory does not carry over to it: the new token
+    /// gets its own renewal, and if that fails too, the warning returns.
+    func testANewClaudeTokenWithTheSameExpiryClearsItAndIsRenewedInItsTurn() async {
+        let setup = claudeSetup()
+        await setup.tick(now)
+        XCTAssertTrue(claudeWarning(setup, setup.stuck))
+
+        setup.signIns.stored[setup.stuck.id] = claudeToken(now.addingTimeInterval(60), "signed in again")
+        await setup.store.refresh()
+        XCTAssertFalse(claudeWarning(setup, setup.stuck), "a different token, same expiry")
+
+        // Past the ten-minute cooldown between launches.
+        await setup.tick(now.addingTimeInterval(11 * 60))
+        XCTAssertEqual(setup.signIns.launches.count, 2, "the new token is not blocked by the old one's attempt")
+        XCTAssertTrue(claudeWarning(setup, setup.stuck), "and its own failure is reported")
+        XCTAssertFalse(claudeWarning(setup, setup.healthy))
     }
 }
