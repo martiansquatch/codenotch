@@ -171,11 +171,17 @@ fn indicator(item: &Item, cfg: &Config, appearance: &Appearance, now: u64) -> In
         .filter(current)
         .filter(|week| head.is_none_or(|head| head.id != week.id))
         .and_then(used);
+    // A Claude plan with no five-hour window and no spend limit declares no headline at all, only
+    // its weeks. The figure is then the weekly one the weekly ring draws, as 1.24.0 printed it;
+    // following the missing headline left a dash there for good (#533, the strip's side of #519).
+    let shown = head.or_else(|| (item.provider == "claude" && item.headline_id.is_none())
+        .then(|| weekly_window(&item.provider, &snap.windows, &cfg.antigravity_model)).flatten()
+        .filter(current));
     Indicator {
         id: item.id.clone(), provider: item.provider.clone(),
         headline: head.and_then(used),
         weekly,
-        text: figure(snap, head, appearance.shows_remaining),
+        text: figure(snap, shown, appearance.shows_remaining),
         work_state: work_state.into(),
         stale: stale(snap, now),
         spent: head.is_some_and(|window| window.used >= 1.0),
@@ -376,6 +382,22 @@ mod tests {
         old.snapshot.fetched_at = now - STALE_MS - 1;
         let shown = indicator(old);
         assert_eq!((shown.headline, shown.weekly, shown.stale), (None, None, true));
+    }
+    #[test]
+    fn a_claude_plan_with_only_weekly_limits_prints_the_weekly_figure() {
+        // #533: /api/oauth/usage answers with the weeks only, so ring_window finds no headline.
+        let weeks = || item("claude", None, vec![window("weekly_all", 0.02), window("weekly_scoped", 0.0)]);
+        let shown = indicator(weeks());
+        assert_eq!((shown.headline, shown.weekly, shown.text.as_str()), (None, Some(0.02), "2%"));
+        // The weekly reading obeys the same currency rules as any Claude window.
+        let mut reset = weeks();
+        reset.snapshot.windows[0].resets_at = Some(now_ms() - 1);
+        assert_eq!(indicator(reset).text, "—");
+        let mut signed_out = weeks();
+        signed_out.snapshot.status = "needsAuth".into();
+        assert_eq!(indicator(signed_out).text, "—");
+        // A declared headline that is missing from the reply still reads as a dash.
+        assert_eq!(indicator(item("claude", Some("session"), vec![window("weekly_all", 0.02)])).text, "—");
     }
     #[test]
     fn other_providers_keep_an_old_reading_and_mark_it_stale() {
