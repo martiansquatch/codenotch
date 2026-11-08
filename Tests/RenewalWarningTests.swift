@@ -300,19 +300,46 @@ final class RenewalWarningTests: XCTestCase {
         XCTAssertEqual(setup.launches(), 1, "and the stuck token is still not retried")
     }
 
-    /// A renewal that does move the expiry takes the warning away.
-    func testASuccessfulRenewalClearsACodexWarning() async throws {
+    /// The real way a held warning ends in a renewal. The failed token is
+    /// never launched for again, so no renewal can follow until a different
+    /// token is stored — and that change is what takes the warning away,
+    /// before the new token's own renewal runs. Every step goes through the
+    /// refresher: a real failed attempt, a reading and a tick on the same
+    /// token, then a new token that is due and renews.
+    func testAHeldCodexWarningClearsOnlyOnceTheTokenChanges() async throws {
         let renewed = now.addingTimeInterval(10 * 24 * 3600)
-        let setup = try codexSetup { try self.writeSignIn($0, expiring: renewed) }
-        // A failure reported earlier, standing when this renewal runs.
-        setup.refresher.onFailure?(setup.stuck.id, setup.stuck.renewalCommand)
-        await setup.store.refresh()
-        XCTAssertTrue(codexWarning(setup, setup.stuck))
+        var setupSoFar: CodexSetup?
+        var warnedAtLaunch: [Bool] = []
+        let setup = try codexSetup { profile in
+            warnedAtLaunch.append(setupSoFar.map { self.codexWarning($0, profile) } ?? false)
+            // The stand-in for `codex` renews only the second token it is given.
+            if warnedAtLaunch.count > 1 { try self.writeSignIn(profile, expiring: renewed) }
+        }
+        setupSoFar = setup
 
+        // The first attempt leaves `auth.json` as it was.
         await setup.refresher.renewDue(now: now)
+        XCTAssertTrue(codexWarning(setup, setup.stuck))
+        guard case .failed = setup.refresher.outcomes[setup.stuck.id] else {
+            return XCTFail("expected a real failure, got \(String(describing: setup.refresher.outcomes[setup.stuck.id]))")
+        }
 
+        // Same token: a reading and a later tick change nothing, and the token
+        // is not launched for again — so no renewal can clear the warning.
+        await setup.store.refresh()
+        await setup.refresher.renewDue(now: now.addingTimeInterval(1800))
+        XCTAssertTrue(codexWarning(setup, setup.stuck))
+        XCTAssertEqual(setup.launches(), 1)
+
+        // Signed in again; the new token is due as well.
+        try writeSignIn(setup.stuck, expiring: now.addingTimeInterval(2 * 3600))
+        await setup.refresher.renewDue(now: now.addingTimeInterval(3600))
+
+        XCTAssertEqual(setup.launches(), 2, "the new token gets its own attempt")
+        XCTAssertEqual(warnedAtLaunch, [false, false],
+                       "the changed token had cleared the warning before its renewal ran")
         XCTAssertEqual(setup.refresher.outcomes[setup.stuck.id], .refreshed(until: renewed))
-        XCTAssertFalse(codexWarning(setup, setup.stuck), "the renewal took it away")
+        XCTAssertFalse(codexWarning(setup, setup.stuck))
         XCTAssertTrue(setup.store.needsRenewal.isEmpty)
         XCTAssertNil(setup.refresher.outcomes[setup.healthy.id], "the healthy profile was left alone")
     }

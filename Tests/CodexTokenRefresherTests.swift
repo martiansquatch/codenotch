@@ -29,14 +29,18 @@ final class CodexTokenRefresherTests: XCTestCase {
     }
 
     /// Writes a fake stored sign-in whose access token expires at `exp`.
-    private func writeSignIn(_ profile: CodexProfile, expiring exp: Date) throws {
+    /// `nonce` makes a different token with the same expiry.
+    private func writeSignIn(_ profile: CodexProfile, expiring exp: Date, nonce: String = "") throws {
         func b64(_ s: String) -> String {
             Data(s.utf8).base64EncodedString()
                 .replacingOccurrences(of: "=", with: "")
                 .replacingOccurrences(of: "+", with: "-")
                 .replacingOccurrences(of: "/", with: "_")
         }
-        let jwt = b64(#"{"alg":"none"}"#) + "." + b64(#"{"exp":\#(Int(exp.timeIntervalSince1970))}"#) + ".sig"
+        let claims = nonce.isEmpty
+            ? #"{"exp":\#(Int(exp.timeIntervalSince1970))}"#
+            : #"{"exp":\#(Int(exp.timeIntervalSince1970)),"n":"\#(nonce)"}"#
+        let jwt = b64(#"{"alg":"none"}"#) + "." + b64(claims) + ".sig"
         let auth = #"{"tokens":{"access_token":"\#(jwt)","account_id":"a"}}"#
         try Data(auth.utf8).write(to: profile.authURL)
     }
@@ -178,18 +182,26 @@ final class CodexTokenRefresherTests: XCTestCase {
     }
 
     /// Once `auth.json` holds a new token, the failure is recovered and the
-    /// new token, when due, gets its own attempt.
+    /// new token, when due, gets its own attempt. The replacement keeps the
+    /// old token's exact expiry and differs only in its fingerprint: the
+    /// one-attempt memory is kept by expiry, so only dropping it on
+    /// replacement lets this token be tried at all.
     func testAReplacedTokenRecoversAndIsRenewedInItsTurn() async throws {
         let home = try makeHome()
         let personal = try profile("personal", in: home)
-        try writeSignIn(personal, expiring: now.addingTimeInterval(3600))
+        let expiry = now.addingTimeInterval(3600)
+        try writeSignIn(personal, expiring: expiry)
         var launches = 0
         var recoveries: [String] = []
         let refresher = CodexTokenRefresher(profiles: [personal], cli: cli) { _, _, _, _ in launches += 1 }
         refresher.onRecovery = { recoveries.append($0) }
 
         await refresher.renewDue(now: now)
-        try writeSignIn(personal, expiring: now.addingTimeInterval(5 * 3600))
+        let failedOn = try XCTUnwrap(CodexTokenRefresher.token(of: personal))
+        try writeSignIn(personal, expiring: expiry, nonce: "signed in again")
+        let replacement = try XCTUnwrap(CodexTokenRefresher.token(of: personal))
+        XCTAssertEqual(replacement.expiry, failedOn.expiry, "the same expiry")
+        XCTAssertNotEqual(replacement.fingerprint, failedOn.fingerprint, "a different token")
         await refresher.renewDue(now: now.addingTimeInterval(1800))
 
         XCTAssertEqual(recoveries, [personal.id])
