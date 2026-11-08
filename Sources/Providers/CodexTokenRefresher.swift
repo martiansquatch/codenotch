@@ -59,6 +59,11 @@ final class CodexTokenRefresher {
     private var attemptedFor: [String: Date] = [:]
     /// Keyed by profile id. What the last attempt for that profile came to.
     private(set) var outcomes: [String: Outcome] = [:]
+    /// Told each time a profile's renewal fails, with that profile's provider
+    /// id and the command that renews it by hand. AppDelegate passes this to
+    /// `UsageStore.reportRenewalFailed`, the same warning a failed Claude
+    /// renewal raises in Settings.
+    var onFailure: (@MainActor (_ providerID: String, _ command: String) -> Void)?
 
     init(profiles: [CodexProfile],
          cli: URL? = CodexTokenRefresher.standalone(),
@@ -138,7 +143,7 @@ final class CodexTokenRefresher {
                 }
             } catch {
                 // Recorded and passed over: the next profile is still renewed.
-                outcomes[key] = .failed("Couldn't run `codex` to renew \(profile.displayName)'s saved login.")
+                fail(profile, "Couldn't run `codex` to renew \(profile.displayName)'s saved login.")
                 Log.usage.error("codex token renewal for \(profile.displayPath, privacy: .public) could not start: \(String(describing: error), privacy: .public)")
                 continue
             }
@@ -146,10 +151,15 @@ final class CodexTokenRefresher {
                 outcomes[key] = .refreshed(until: after)
                 Log.usage.notice("codex token for \(profile.displayPath, privacy: .public) renewed, now expires \(after, privacy: .public)")
             } else {
-                outcomes[key] = .failed("\(profile.displayName) usage needs its sign-in renewed — run `\(profile.signInCommand)`.")
+                fail(profile, "\(profile.displayName) usage needs its sign-in renewed — run `\(profile.renewalCommand)` once in a terminal.")
                 Log.usage.error("codex token renewal for \(profile.displayPath, privacy: .public) did not move the expiry")
             }
         }
+    }
+
+    private func fail(_ profile: CodexProfile, _ message: String) {
+        outcomes[profile.id] = .failed(message)
+        onFailure?(profile.id, profile.renewalCommand)
     }
 
     // MARK: - Running it

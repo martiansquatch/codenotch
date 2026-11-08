@@ -34440,73 +34440,73 @@
         }
       }
     },
-    "%@ usage needs its sign-in renewed — run `claude` once in a terminal.": {
+    "%@ usage needs its sign-in renewed — run `%@` once in a terminal.": {
       "extractionState": "manual",
       "localizations": {
         "ja": {
           "stringUnit": {
             "state": "translated",
-            "value": "%@ の使用量はサインインの更新が必要です — ターミナルで `claude` を一度実行してください。"
+            "value": "%@ の使用量はサインインの更新が必要です — ターミナルで `%@` を一度実行してください。"
           }
         },
         "zh-Hans": {
           "stringUnit": {
             "state": "translated",
-            "value": "%@ 用量需要重新登录 — 在终端里运行一次 `claude`。"
+            "value": "%@ 用量需要重新登录 — 在终端里运行一次 `%@`。"
           }
         },
         "zh-Hant": {
           "stringUnit": {
             "state": "translated",
-            "value": "%@ 用量需要重新登入 — 在終端裡執行一次 `claude`。"
+            "value": "%@ 用量需要重新登入 — 在終端裡執行一次 `%@`。"
           }
         },
         "ru": {
           "stringUnit": {
             "state": "translated",
-            "value": "Для использования %@ нужно обновить вход — один раз запустите `claude` в терминале."
+            "value": "Для использования %@ нужно обновить вход — один раз запустите `%@` в терминале."
           }
         },
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "Die Anmeldung für die %@-Nutzung muss erneuert werden — führe einmal `claude` in einem Terminal aus."
+            "value": "Die Anmeldung für die %@-Nutzung muss erneuert werden — führe einmal `%@` in einem Terminal aus."
           }
         },
         "uk": {
           "stringUnit": {
             "state": "translated",
-            "value": "Щоб читати використання %@, потрібно поновити вхід — запустіть `claude` один раз у терміналі."
+            "value": "Щоб читати використання %@, потрібно поновити вхід — запустіть `%@` один раз у терміналі."
           }
         },
         "ko": {
           "stringUnit": {
             "state": "translated",
-            "value": "%@ 사용량을 읽으려면 로그인을 갱신해야 합니다 — 터미널에서 `claude`를 한 번 실행하십시오."
+            "value": "%@ 사용량을 읽으려면 로그인을 갱신해야 합니다 — 터미널에서 `%@`를 한 번 실행하십시오."
           }
         },
         "uz": {
           "stringUnit": {
             "state": "translated",
-            "value": "%@ foydalanishi uchun kirish yangilanishi kerak — terminalda bir marta `claude` ni ishga tushiring."
+            "value": "%@ foydalanishi uchun kirish yangilanishi kerak — terminalda bir marta `%@` ni ishga tushiring."
           }
         },
         "id": {
           "stringUnit": {
             "state": "translated",
-            "value": "Penggunaan %@ memerlukan pembaruan login — jalankan `claude` sekali di terminal."
+            "value": "Penggunaan %@ memerlukan pembaruan login — jalankan `%@` sekali di terminal."
           }
         },
         "tr": {
           "stringUnit": {
             "state": "translated",
-            "value": "%@ kullanımının girişinin yenilenmesi gerekiyor — bir terminalde `claude` komutunu bir kez çalıştırın."
+            "value": "%@ kullanımının girişinin yenilenmesi gerekiyor — bir terminalde `%@` komutunu bir kez çalıştırın."
           }
         },
         "es": {
           "stringUnit": {
             "state": "translated",
-            "value": "El uso de %@ necesita renovar el inicio de sesión: ejecuta `claude` una vez en una terminal."
+            "value": "El uso de %@ necesita renovar el inicio de sesión: ejecuta `%@` una vez en una terminal."
           }
         }
       }

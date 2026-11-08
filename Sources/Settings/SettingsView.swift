@@ -2124,8 +2124,8 @@ private struct AccountRow: View {
             // one — the credential is there, it is simply too old to use. Put
             // inside, this warning would be swallowed by the very row that
             // makes everything look fine.
-            if isConnected, provider.needsSignInRenewal {
-                Text(L10n.t("\(provider.name) usage needs its sign-in renewed — run `claude` once in a terminal."))
+            if isConnected, let warning = provider.renewalWarning {
+                Text(warning)
                     .font(.caption)
                     .foregroundStyle(.orange)
                     .padding(.leading, 48)

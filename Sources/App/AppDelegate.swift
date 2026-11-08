@@ -1148,7 +1148,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 .receive(on: RunLoop.main)
                 .sink { [weak self] outcome in
                     guard case .failed = outcome else { return }
-                    self?.store?.reportRenewalFailed(providerID: provider.id)
+                    self?.store?.reportRenewalFailed(providerID: provider.id,
+                                                     command: profile.renewalCommand)
                 }
                 .store(in: &cancellables)
 
@@ -1158,8 +1159,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Codex renews `auth.json` only while it is used, so a second profile
         // left alone expired and kept its last reading. One refresher walks
-        // every profile; a failure on one never holds back the next.
+        // every profile; a failure on one never holds back the next. A failure
+        // raises the same Settings warning as Claude's, on that profile's row.
         let codexRefresher = CodexTokenRefresher(profiles: codexProfiles)
+        codexRefresher.onFailure = { [weak self] providerID, command in
+            self?.store?.reportRenewalFailed(providerID: providerID, command: command)
+        }
         codexRefresher.start()
         codexTokenRefresher = codexRefresher
         let activity = ActivityCoordinator(monitors: monitors) { [weak self, weak fleet] id, sessions in

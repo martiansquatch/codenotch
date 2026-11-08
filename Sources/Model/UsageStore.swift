@@ -24,7 +24,10 @@ final class UsageStore: ObservableObject {
     /// any snapshot says anything is wrong — which is exactly how a frozen
     /// reading went unnoticed for twelve hours. Reading it off the snapshot
     /// would reproduce the bug.
-    @Published private(set) var needsRenewal: Set<String> = []
+    ///
+    /// Keyed by provider id; the value is the command that renews that login
+    /// by hand, which differs per tool and per profile.
+    @Published private(set) var needsRenewal: [String: String] = [:]
     /// Bumped when a provider's authentication state changes. Settings listens
     /// to this separately from usage snapshots so it can re-read account
     /// summaries without re-reading every credential on every polling pass.
@@ -315,7 +318,7 @@ final class UsageStore: ObservableObject {
                             account: disconnected.contains(provider.id) ? nil : provider.account(),
                             signIn: provider.signInRoute,
                             wasRefusedAccess: refusedAccess.contains(provider.id),
-                            needsSignInRenewal: needsRenewal.contains(provider.id))
+                            renewalCommand: needsRenewal[provider.id])
             return [summary] + models.filter { $0.sourceProviderID == provider.id }
         }
         return ProviderOrder.arrange(summaries, by: order, id: \.id)
@@ -750,12 +753,13 @@ final class UsageStore: ObservableObject {
 
     /// Say that a provider's saved login needs renewing by hand.
     ///
-    /// Called by `ClaudeTokenRefresher` when it tried and the expiry did not
-    /// move. The store only carries the fact so Settings can show it; it starts
-    /// nothing and retries nothing.
-    func reportRenewalFailed(providerID: String) {
-        guard !needsRenewal.contains(providerID) else { return }
-        needsRenewal.insert(providerID)
+    /// Called when `ClaudeTokenRefresher` or `CodexTokenRefresher` tried and
+    /// the expiry did not move. `command` is what the user should run for that
+    /// profile. The store only carries the fact so Settings can show it; it
+    /// starts nothing and retries nothing.
+    func reportRenewalFailed(providerID: String, command: String) {
+        guard needsRenewal[providerID] == nil else { return }
+        needsRenewal[providerID] = command
         Log.usage.notice("\(providerID, privacy: .public): saved login needs renewing by hand")
     }
 
@@ -843,7 +847,7 @@ final class UsageStore: ObservableObject {
             // A reading that actually came back is proof the credential works,
             // whatever was thought a moment ago. The only way this clears —
             // there is no timer and nothing retries.
-            needsRenewal.remove(provider.id)
+            needsRenewal.removeValue(forKey: provider.id)
             Log.usage.debug("\(provider.id, privacy: .public): \(fresh.windows.count) window(s)")
             return fresh
         } catch {

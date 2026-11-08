@@ -396,6 +396,11 @@ struct ClaudeProfile: Equatable, Hashable {
         let path = "'" + configDirectory.path.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
         return "CLAUDE_CONFIG_DIR=\(path) claude"
     }
+
+    /// What renews this profile's saved login by hand: Claude Code run once
+    /// against this profile's directory. Plain `claude` renews only the
+    /// default profile, so a second login has to be named (#473).
+    var renewalCommand: String { signInCommand }
 }
 
 /// One decode of a profile's `.claude.json`, held until the file changes.

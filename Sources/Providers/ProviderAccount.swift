@@ -173,5 +173,23 @@ struct ProviderSummary: Identifiable, Equatable {
     /// `wasRefusedAccess` is not: an expired token leaves the last reading in
     /// place and looking fine. Tying the warning to "is there a reading" would
     /// hide it behind exactly the stale number it is warning about.
-    var needsSignInRenewal: Bool = false
+    var needsSignInRenewal: Bool { renewalCommand != nil }
+    /// The command that renews this login by hand — `claude`, or
+    /// `CLAUDE_CONFIG_DIR=… claude` for a second Claude profile, `codex` or
+    /// `CODEX_HOME=… codex` for Codex. Nil while nothing needs renewing.
+    var renewalCommand: String? = nil
+
+    /// The line Settings shows under the row when the login needs renewing.
+    var renewalWarning: String? {
+        renewalCommand.map { Self.renewalWarning(name: name, command: $0) }
+    }
+
+    /// Names the command for the profile that failed: plain `claude` renews
+    /// only the default profile, so telling a second login to run it sends the
+    /// user to fix the wrong account (#473).
+    static func renewalWarning(name: String, command: String,
+                               locale: Locale = L10n.locale) -> String {
+        L10n.t("\(name) usage needs its sign-in renewed — run `\(command)` once in a terminal.",
+               locale: locale)
+    }
 }

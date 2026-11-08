@@ -76,9 +76,19 @@ struct CodexProfile: Equatable, Hashable {
 
     var signInCommand: String {
         guard slug != nil else { return "codex login" }
-        // Quote the actual path, including spaces and apostrophes. A quoted ~
-        // would not expand, and an unquoted slug could become shell syntax.
-        let path = "'" + configDirectory.path.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
-        return "CODEX_HOME=\(path) codex -c 'cli_auth_credentials_store=\"file\"' login"
+        return "CODEX_HOME=\(quotedDirectory) codex -c 'cli_auth_credentials_store=\"file\"' login"
+    }
+
+    /// What renews this profile's saved login by hand: Codex run once against
+    /// this profile's home, which refreshes `auth.json` as it starts (#473).
+    var renewalCommand: String {
+        guard slug != nil else { return "codex" }
+        return "CODEX_HOME=\(quotedDirectory) codex"
+    }
+
+    // Quote the actual path, including spaces and apostrophes. A quoted ~
+    // would not expand, and an unquoted slug could become shell syntax.
+    private var quotedDirectory: String {
+        "'" + configDirectory.path.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
     }
 }
