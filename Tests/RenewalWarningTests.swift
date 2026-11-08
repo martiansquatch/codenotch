@@ -204,7 +204,7 @@ final class RenewalWarningTests: XCTestCase {
                 cli: URL(fileURLWithPath: "/opt/homebrew/bin/codex"),
                 readExpiry: { expiries[$0.id] },
                 launcher: { _, _, _, _ in if throwing { throw CancellationError() } })
-            refresher.onFailure = store.reportRenewalFailed(providerID:command:)
+            refresher.warn(through: { store })
 
             await refresher.renewDue(now: now)
 
@@ -215,5 +215,156 @@ final class RenewalWarningTests: XCTestCase {
                            "throwing: \(throwing)")
             XCTAssertTrue(personal.renewalCommand.hasPrefix("CODEX_HOME='"))
         }
+    }
+
+    // MARK: - A Codex warning stays until it is resolved
+
+    /// Codex renewal is tried a day before expiry, so after a failure the old
+    /// token keeps returning readings for hours. Clearing the warning on one
+    /// hid the failure until the token died. These use real `auth.json` files
+    /// in a temporary directory; nothing runs `codex`.
+    private struct CodexSetup {
+        let store: UsageStore
+        let refresher: CodexTokenRefresher
+        let healthy: CodexProfile
+        let stuck: CodexProfile
+        let launches: () -> Int
+    }
+
+    private let now = Date(timeIntervalSince1970: 1_700_000_000)
+
+    /// Writes a stored sign-in whose access token expires at `exp`. `nonce`
+    /// makes a different token with the same expiry.
+    private func writeSignIn(_ profile: CodexProfile, expiring exp: Date, nonce: String = "") throws {
+        func b64(_ s: String) -> String {
+            Data(s.utf8).base64EncodedString()
+                .replacingOccurrences(of: "=", with: "")
+                .replacingOccurrences(of: "+", with: "-")
+                .replacingOccurrences(of: "/", with: "_")
+        }
+        let claims = #"{"exp":\#(Int(exp.timeIntervalSince1970)),"n":"\#(nonce)"}"#
+        let jwt = b64(#"{"alg":"none"}"#) + "." + b64(claims) + ".sig"
+        let auth = #"{"tokens":{"access_token":"\#(jwt)","account_id":"a"}}"#
+        try Data(auth.utf8).write(to: profile.authURL)
+    }
+
+    /// A healthy default profile and a second one due for renewal, wired to
+    /// the store the way AppDelegate wires them. `renew` decides what the
+    /// stand-in for `codex app-server` does with the due profile.
+    private func codexSetup(renew: @escaping (CodexProfile) throws -> Void = { _ in }) throws -> CodexSetup {
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RenewalWarningTests.\(UUID().uuidString)")
+        addTeardownBlock { try? FileManager.default.removeItem(at: home) }
+        let healthy = CodexProfile.default(home: home)
+        let stuck = CodexProfile(slug: "personal", configDirectory: home.appendingPathComponent(".codex-personal"))
+        for profile in [healthy, stuck] {
+            try FileManager.default.createDirectory(at: profile.configDirectory,
+                                                    withIntermediateDirectories: true)
+        }
+        try writeSignIn(healthy, expiring: now.addingTimeInterval(10 * 24 * 3600))
+        try writeSignIn(stuck, expiring: now.addingTimeInterval(3600))
+
+        let store = store(Provider(id: healthy.id, displayName: "Codex"),
+                          Provider(id: stuck.id, displayName: "Codex (personal)"))
+        var launches = 0
+        let refresher = CodexTokenRefresher(
+            profiles: [healthy, stuck],
+            cli: URL(fileURLWithPath: "/opt/homebrew/bin/codex"),
+            launcher: { _, profile, _, _ in
+                launches += 1
+                try renew(profile)
+            })
+        refresher.warn(through: { store })
+        return CodexSetup(store: store, refresher: refresher, healthy: healthy, stuck: stuck,
+                          launches: { launches })
+    }
+
+    private func codexWarning(_ setup: CodexSetup, _ profile: CodexProfile) -> Bool {
+        setup.store.providerSummaries.first { $0.id == profile.id }?.needsSignInRenewal ?? false
+    }
+
+    /// The regression: the old token still answers, a reading comes back, and
+    /// the warning must stay — the refresher will not try that token again.
+    func testAReadingDoesNotClearACodexWarning() async throws {
+        let setup = try codexSetup()
+        await setup.refresher.renewDue(now: now)
+        XCTAssertTrue(codexWarning(setup, setup.stuck))
+
+        await setup.store.refresh()
+        await setup.store.refresh()
+        await setup.refresher.renewDue(now: now.addingTimeInterval(1800))
+
+        XCTAssertTrue(codexWarning(setup, setup.stuck), "a reading from the old token proves nothing")
+        XCTAssertEqual(setup.store.needsRenewal, [setup.stuck.id: setup.stuck.renewalCommand])
+        XCTAssertFalse(codexWarning(setup, setup.healthy), "the healthy profile never warns")
+        XCTAssertEqual(setup.launches(), 1, "and the stuck token is still not retried")
+    }
+
+    /// A renewal that does move the expiry takes the warning away.
+    func testASuccessfulRenewalClearsACodexWarning() async throws {
+        let renewed = now.addingTimeInterval(10 * 24 * 3600)
+        let setup = try codexSetup { try self.writeSignIn($0, expiring: renewed) }
+        // A failure reported earlier, standing when this renewal runs.
+        setup.refresher.onFailure?(setup.stuck.id, setup.stuck.renewalCommand)
+        await setup.store.refresh()
+        XCTAssertTrue(codexWarning(setup, setup.stuck))
+
+        await setup.refresher.renewDue(now: now)
+
+        XCTAssertEqual(setup.refresher.outcomes[setup.stuck.id], .refreshed(until: renewed))
+        XCTAssertFalse(codexWarning(setup, setup.stuck), "the renewal took it away")
+        XCTAssertTrue(setup.store.needsRenewal.isEmpty)
+        XCTAssertNil(setup.refresher.outcomes[setup.healthy.id], "the healthy profile was left alone")
+    }
+
+    /// The user ran the command: `auth.json` now holds a different token. The
+    /// next reading notices, without waiting for the refresher's next tick.
+    func testATokenChangeInAuthJSONClearsACodexWarning() async throws {
+        let setup = try codexSetup()
+        await setup.refresher.renewDue(now: now)
+        await setup.store.refresh()
+        XCTAssertTrue(codexWarning(setup, setup.stuck))
+
+        let renewed = now.addingTimeInterval(10 * 24 * 3600)
+        try writeSignIn(setup.stuck, expiring: renewed)       // what running `codex` does
+        await setup.store.refresh()
+
+        XCTAssertFalse(codexWarning(setup, setup.stuck), "the replaced token took it away")
+        XCTAssertTrue(setup.store.needsRenewal.isEmpty)
+        XCTAssertEqual(setup.refresher.outcomes[setup.stuck.id], .replaced(until: renewed))
+        XCTAssertFalse(codexWarning(setup, setup.healthy))
+    }
+
+    /// The refresher's own tick notices a replaced token too, with no reading.
+    func testTheRefresherTickNoticesAReplacedToken() async throws {
+        let setup = try codexSetup()
+        await setup.refresher.renewDue(now: now)
+        XCTAssertTrue(codexWarning(setup, setup.stuck))
+
+        let renewed = now.addingTimeInterval(10 * 24 * 3600)
+        try writeSignIn(setup.stuck, expiring: renewed)
+        await setup.refresher.renewDue(now: now.addingTimeInterval(1800))
+
+        XCTAssertFalse(codexWarning(setup, setup.stuck))
+        XCTAssertEqual(setup.refresher.outcomes[setup.stuck.id], .replaced(until: renewed))
+        XCTAssertEqual(setup.launches(), 1, "a token with days left is not launched for")
+    }
+
+    /// A different token with the very same expiry still counts as replaced,
+    /// and the one-attempt memory does not carry over to it: the new token
+    /// gets its own renewal, and if that fails too, the warning returns.
+    func testANewTokenWithTheSameExpiryClearsItAndIsRenewedInItsTurn() async throws {
+        let setup = try codexSetup()
+        await setup.refresher.renewDue(now: now)
+        XCTAssertTrue(codexWarning(setup, setup.stuck))
+
+        try writeSignIn(setup.stuck, expiring: now.addingTimeInterval(3600), nonce: "signed in again")
+        await setup.store.refresh()
+        XCTAssertFalse(codexWarning(setup, setup.stuck), "a different token, same expiry")
+
+        await setup.refresher.renewDue(now: now.addingTimeInterval(60))
+        XCTAssertEqual(setup.launches(), 2, "the new token is not blocked by the old one's attempt")
+        XCTAssertTrue(codexWarning(setup, setup.stuck), "and its own failure is reported")
+        XCTAssertFalse(codexWarning(setup, setup.healthy))
     }
 }

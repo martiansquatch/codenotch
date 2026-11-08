@@ -157,6 +157,60 @@ final class CodexTokenRefresherTests: XCTestCase {
         XCTAssertNil(refresher.outcomes[primary.id])
     }
 
+    /// A failure is reported once and stays reported: a later tick on the same
+    /// token neither retries nor recovers it.
+    func testAFailureIsNotRecoveredWhileTheTokenIsUnchanged() async throws {
+        let home = try makeHome()
+        let personal = try profile("personal", in: home)
+        try writeSignIn(personal, expiring: now.addingTimeInterval(3600))
+        var failures: [String] = []
+        var recoveries: [String] = []
+        let refresher = CodexTokenRefresher(profiles: [personal], cli: cli) { _, _, _, _ in }
+        refresher.onFailure = { id, _ in failures.append(id) }
+        refresher.onRecovery = { recoveries.append($0) }
+
+        await refresher.renewDue(now: now)
+        await refresher.renewDue(now: now.addingTimeInterval(1800))
+        refresher.noticeReplacedToken(providerID: personal.id)
+
+        XCTAssertEqual(failures, [personal.id])
+        XCTAssertEqual(recoveries, [])
+    }
+
+    /// Once `auth.json` holds a new token, the failure is recovered and the
+    /// new token, when due, gets its own attempt.
+    func testAReplacedTokenRecoversAndIsRenewedInItsTurn() async throws {
+        let home = try makeHome()
+        let personal = try profile("personal", in: home)
+        try writeSignIn(personal, expiring: now.addingTimeInterval(3600))
+        var launches = 0
+        var recoveries: [String] = []
+        let refresher = CodexTokenRefresher(profiles: [personal], cli: cli) { _, _, _, _ in launches += 1 }
+        refresher.onRecovery = { recoveries.append($0) }
+
+        await refresher.renewDue(now: now)
+        try writeSignIn(personal, expiring: now.addingTimeInterval(5 * 3600))
+        await refresher.renewDue(now: now.addingTimeInterval(1800))
+
+        XCTAssertEqual(recoveries, [personal.id])
+        XCTAssertEqual(launches, 2, "the new token is due too, and is tried once")
+        guard case .failed = refresher.outcomes[personal.id] else {
+            return XCTFail("the new token's own attempt did not move it either")
+        }
+    }
+
+    /// What is remembered about a stored token is a digest, never the token.
+    func testTheStoredTokenIsFingerprintedNotKept() throws {
+        let home = try makeHome()
+        let p = try profile(nil, in: home)
+        try writeSignIn(p, expiring: now)
+        let token = try XCTUnwrap(CodexTokenRefresher.token(of: p))
+        XCTAssertEqual(token.expiry, now)
+        XCTAssertEqual(token.fingerprint?.count, 64)
+        let raw = try String(contentsOf: p.authURL, encoding: .utf8)
+        XCTAssertFalse(raw.contains(token.fingerprint ?? "-"))
+    }
+
     func testTheAppServerRunsAgainstTheProfilesOwnHome() {
         let p = CodexProfile(slug: "personal",
                              configDirectory: URL(fileURLWithPath: "/Users/someone/.codex-personal"))

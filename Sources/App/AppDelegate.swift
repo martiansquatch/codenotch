@@ -1160,11 +1160,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Codex renews `auth.json` only while it is used, so a second profile
         // left alone expired and kept its last reading. One refresher walks
         // every profile; a failure on one never holds back the next. A failure
-        // raises the same Settings warning as Claude's, on that profile's row.
+        // raises the same Settings warning as Claude's, on that profile's row,
+        // and it stays until the profile is renewed or its token is replaced —
+        // not merely until the old token next returns a reading.
         let codexRefresher = CodexTokenRefresher(profiles: codexProfiles)
-        codexRefresher.onFailure = { [weak self] providerID, command in
-            self?.store?.reportRenewalFailed(providerID: providerID, command: command)
-        }
+        codexRefresher.warn(through: { [weak self] in self?.store })
         codexRefresher.start()
         codexTokenRefresher = codexRefresher
         let activity = ActivityCoordinator(monitors: monitors) { [weak self, weak fleet] id, sessions in

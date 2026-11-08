@@ -28,6 +28,12 @@ final class UsageStore: ObservableObject {
     /// Keyed by provider id; the value is the command that renews that login
     /// by hand, which differs per tool and per profile.
     @Published private(set) var needsRenewal: [String: String] = [:]
+    /// Warnings a usage reading does not clear, keyed by provider id, with what
+    /// to call when a reading comes back so their owner can check whether the
+    /// stored login was replaced. Codex: renewal starts a day before expiry, so
+    /// after a failure the old token keeps working for hours, and a reading
+    /// coming back says nothing about whether it will be renewed.
+    private var renewalRechecks: [String: @MainActor () -> Void] = [:]
     /// Bumped when a provider's authentication state changes. Settings listens
     /// to this separately from usage snapshots so it can re-read account
     /// summaries without re-reading every credential on every polling pass.
@@ -763,6 +769,26 @@ final class UsageStore: ObservableObject {
         Log.usage.notice("\(providerID, privacy: .public): saved login needs renewing by hand")
     }
 
+    /// The same warning, held until `reportRenewalRecovered` takes it away.
+    ///
+    /// For a renewal attempted long before expiry (Codex, a day ahead): the old
+    /// token still works afterwards, so a usage reading coming back is no
+    /// evidence the problem went away, and clearing on one hid it until the
+    /// token died. A reading only calls `recheck`, which lets the owner look
+    /// at the stored token and report recovery if it was replaced.
+    func reportRenewalFailed(providerID: String, command: String,
+                             recheck: @escaping @MainActor () -> Void) {
+        renewalRechecks[providerID] = recheck
+        reportRenewalFailed(providerID: providerID, command: command)
+    }
+
+    /// Take a held warning away: the login was renewed, or replaced by hand.
+    func reportRenewalRecovered(providerID: String) {
+        renewalRechecks.removeValue(forKey: providerID)
+        guard needsRenewal.removeValue(forKey: providerID) != nil else { return }
+        Log.usage.notice("\(providerID, privacy: .public): saved login renewed; warning cleared")
+    }
+
     /// Ask macOS for this provider's credential again.
     ///
     /// The remedy for a declined keychain prompt. Dropping the in-memory copy
@@ -845,9 +871,16 @@ final class UsageStore: ObservableObject {
             }
             refusedAccess.remove(provider.id)
             // A reading that actually came back is proof the credential works,
-            // whatever was thought a moment ago. The only way this clears —
-            // there is no timer and nothing retries.
-            needsRenewal.removeValue(forKey: provider.id)
+            // whatever was thought a moment ago — for a renewal tried minutes
+            // before expiry (Claude), where nothing else could be serving it.
+            // A warning held for confirmation (Codex, tried a day ahead) is
+            // not cleared by a reading: the old token still works for hours.
+            // The reading only prompts its owner to look at the stored token.
+            if let recheck = renewalRechecks[provider.id] {
+                recheck()
+            } else {
+                needsRenewal.removeValue(forKey: provider.id)
+            }
             Log.usage.debug("\(provider.id, privacy: .public): \(fresh.windows.count) window(s)")
             return fresh
         } catch {
