@@ -25,8 +25,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var limitWatcher: UsageLimitWatcher?
     private var statusItem: StatusItemController?
     /// Keeps the Claude keychain token from ageing out on a Mac where the CLI
-    /// is never run by hand. See `ClaudeTokenRefresher`.
-    private var tokenRefresher: ClaudeTokenRefresher?
+    /// is never run by hand — one per profile. See `ClaudeTokenRefresher`.
+    private var tokenRefreshers: [ClaudeTokenRefresher] = []
+    /// The same for every Codex profile's `auth.json`. See `CodexTokenRefresher`.
+    private var codexTokenRefresher: CodexTokenRefresher?
     private var cancellables = Set<AnyCancellable>()
     /// Turns the monitors' running commentary into the one event worth
     /// interrupting for: an agent that has just stopped working.
@@ -1116,23 +1118,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // step over that pid, so it never reaches the notch and never counts as
         // work in progress.
         //
-        // Only the default profile is renewed. The command writes whichever
-        // directory `CLAUDE_CONFIG_DIR` names, so a second profile would need
-        // that passed through — behaviour nobody has been able to try on a Mac
-        // with two of them, and an unverified guess is worse here than a ring
-        // that ages the way it already does.
-        if let defaultProvider = claudeProviders.first(where: { $0.profile.slug == nil }) {
-            let refresher = ClaudeTokenRefresher(
-                expiry: { await defaultProvider.tokenExpiry },
-                reload: { await defaultProvider.reloadTokenExpiry() }
-            )
+        // Every profile is renewed (#473). The command writes whichever
+        // directory `CLAUDE_CONFIG_DIR` names, so each profile's refresher
+        // passes its own; the default profile passes none. Renewing only the
+        // default left a second login that sat unused for a few hours to age
+        // out, and its ring stopped moving.
+        let providerByProfile = Dictionary(claudeProviders.map { ($0.profile, $0) },
+                                           uniquingKeysWith: { first, _ in first })
+        let pairs = ClaudeTokenRefresher.forEveryProfile(
+            claudeProviders.map(\.profile),
+            expiry: { profile in await providerByProfile[profile]?.tokenExpiry },
+            reload: { profile in await providerByProfile[profile]?.reloadTokenExpiry() }
+        )
+        let refreshers = pairs.map(\.refresher)
+        if !refreshers.isEmpty {
             for monitor in claudeMonitors {
-                monitor.ignoredPIDs = { [weak refresher] in
-                    var pids = ClaudeUsageCLI.runningPIDs
-                    if let pid = refresher?.launchedPID { pids.insert(pid) }
-                    return pids
+                monitor.ignoredPIDs = {
+                    ClaudeUsageCLI.runningPIDs
+                        .union(ClaudeTokenRefresher.launchedPIDs(of: refreshers))
                 }
             }
+        }
+        for (profile, refresher) in pairs {
+            guard let provider = providerByProfile[profile] else { continue }
             // The one place the failure becomes visible. The store carries the
             // fact; nothing here retries, and the warning clears itself the
             // moment a reading comes back.
@@ -1140,13 +1148,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 .receive(on: RunLoop.main)
                 .sink { [weak self] outcome in
                     guard case .failed = outcome else { return }
-                    self?.store?.reportRenewalFailed(providerID: defaultProvider.id)
+                    self?.store?.reportRenewalFailed(providerID: provider.id)
                 }
                 .store(in: &cancellables)
 
             refresher.start()
-            tokenRefresher = refresher
         }
+        tokenRefreshers = refreshers
+
+        // Codex renews `auth.json` only while it is used, so a second profile
+        // left alone expired and kept its last reading. One refresher walks
+        // every profile; a failure on one never holds back the next.
+        let codexRefresher = CodexTokenRefresher(profiles: codexProfiles)
+        codexRefresher.start()
+        codexTokenRefresher = codexRefresher
         let activity = ActivityCoordinator(monitors: monitors) { [weak self, weak fleet] id, sessions in
             guard let fleet else { return }
             fleet.setSessions(providerID: id, sessions: sessions)
@@ -1513,7 +1528,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ollamaRelay?.configure(enabled: false, endpoint: OllamaEndpoint.defaultAddress)
         lmstudioMetrics?.stop()
         omlxMetrics?.stop()
-        tokenRefresher?.stop()
+        tokenRefreshers.forEach { $0.stop() }
+        codexTokenRefresher?.stop()
         piResponseMonitor?.stop()
         store?.stop()
         openCodeActivityBridge?.stop()

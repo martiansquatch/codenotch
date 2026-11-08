@@ -60,6 +60,12 @@ final class ClaudeTokenRefresher: ObservableObject {
 
     private let cli: URL?
     private let launcher: Launcher
+    /// The profile directory the command is pointed at through
+    /// `CLAUDE_CONFIG_DIR`. Nil for the default `~/.claude`, which must be
+    /// renewed with that variable absent rather than set to its own path:
+    /// Claude Code files the default token under a different keychain name
+    /// than an explicitly named directory.
+    let configDirectory: URL?
     /// The token's expiry as the usage provider last read it. Cheap: it is the
     /// value already in hand, so asking costs no keychain traffic and no prompt.
     private let expiry: @MainActor () async -> Date?
@@ -86,7 +92,8 @@ final class ClaudeTokenRefresher: ObservableObject {
         cooldown: TimeInterval = 10 * 60,
         timeout: TimeInterval = 30,
         interval: TimeInterval = 60,
-        launcher: @escaping Launcher = ClaudeTokenRefresher.run
+        configDirectory: URL? = nil,
+        launcher: Launcher? = nil
     ) {
         self.expiry = expiry
         self.reload = reload
@@ -95,7 +102,47 @@ final class ClaudeTokenRefresher: ObservableObject {
         self.cooldown = cooldown
         self.timeout = timeout
         self.interval = interval
-        self.launcher = launcher
+        self.configDirectory = configDirectory
+        // A profile other than `~/.claude` is renewed by naming its directory,
+        // exactly as the shell alias that signed it in does.
+        self.launcher = launcher ?? { cli, timeout in
+            try ClaudeTokenRefresher.run(cli, timeout: timeout, configDirectory: configDirectory)
+        }
+    }
+
+    /// One refresher per Claude profile, each renewing its own directory.
+    ///
+    /// #473: only the default profile used to be renewed, so a second login
+    /// (`~/.claude-personal`, say) that sat unused for a few hours aged out and
+    /// its ring stopped moving. Every profile now gets the same refresher with
+    /// the same one-attempt gate; they share nothing, so a failure on one
+    /// cannot hold back another.
+    ///
+    /// `launcher` is the seam the tests use to stand in for the command per
+    /// profile; left nil, each refresher runs the real one.
+    static func forEveryProfile(
+        _ profiles: [ClaudeProfile],
+        expiry: @escaping @MainActor (ClaudeProfile) async -> Date?,
+        reload: @escaping @MainActor (ClaudeProfile) async -> Date?,
+        cli: URL? = ClaudeCLI.standalone(),
+        launcher: ((ClaudeProfile) -> Launcher)? = nil
+    ) -> [(profile: ClaudeProfile, refresher: ClaudeTokenRefresher)] {
+        profiles.map { profile in
+            let refresher = ClaudeTokenRefresher(
+                expiry: { await expiry(profile) },
+                reload: { await reload(profile) },
+                cli: cli,
+                configDirectory: profile.slug == nil ? nil : profile.configDirectory,
+                launcher: launcher?(profile)
+            )
+            return (profile, refresher)
+        }
+    }
+
+    /// Every pid any of these refreshers has running right now — what the
+    /// Claude session monitors step over, whichever profile launched it.
+    static func launchedPIDs(of refreshers: [ClaudeTokenRefresher]) -> Set<Int32> {
+        Set(refreshers.compactMap(\.launchedPID))
     }
 
     func start() {
@@ -215,18 +262,34 @@ final class ClaudeTokenRefresher: ObservableObject {
     /// volumes to the user as Codenotch asking for access.
     static let arguments = ["-p", "--no-session-persistence", "--strict-mcp-config"]
 
-    static func run(_ cli: URL, timeout: TimeInterval) throws
+    /// The environment the renewal runs with. Pure, so the one thing that
+    /// differs between profiles — `CLAUDE_CONFIG_DIR` — is testable without
+    /// launching anything.
+    static func environment(base: [String: String], scratch: URL?,
+                            configDirectory: URL?) -> [String: String] {
+        var environment = base
+        if let scratch { environment["PWD"] = scratch.path }
+        // Nil for the default profile, which must not inherit a stray value
+        // from wherever the app happened to be launched.
+        if let configDirectory {
+            environment["CLAUDE_CONFIG_DIR"] = configDirectory.path
+        } else {
+            environment.removeValue(forKey: "CLAUDE_CONFIG_DIR")
+        }
+        return environment
+    }
+
+    static func run(_ cli: URL, timeout: TimeInterval, configDirectory: URL? = nil) throws
         -> (pid: Int32, exit: () async -> Int32?) {
         let process = Process()
         process.executableURL = cli
         process.arguments = Self.arguments
         // The same fixed directory `/usage` runs from, never the app's own.
-        if let scratch = try? ClaudeUsageCLI.scratchDirectory() {
-            process.currentDirectoryURL = scratch
-            var environment = ProcessInfo.processInfo.environment
-            environment["PWD"] = scratch.path
-            process.environment = environment
-        }
+        let scratch = try? ClaudeUsageCLI.scratchDirectory()
+        if let scratch { process.currentDirectoryURL = scratch }
+        process.environment = environment(base: ProcessInfo.processInfo.environment,
+                                          scratch: scratch,
+                                          configDirectory: configDirectory)
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice

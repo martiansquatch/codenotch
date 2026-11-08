@@ -422,3 +422,147 @@ final class ClaudeTokenRefresherTests: XCTestCase {
                        "the flag is variadic and would swallow what follows it")
     }
 }
+
+/// #473: every Claude profile is renewed, not only `~/.claude`.
+///
+/// Simulated accounts only: two fake stored sign-ins whose expiries and
+/// renewals are stood in for per profile. Nothing here touches the keychain or
+/// runs `claude`.
+@MainActor
+final class ClaudeTokenRefresherEveryProfileTests: XCTestCase {
+    private let now = Date(timeIntervalSince1970: 1_700_000_000)
+    private let home = URL(fileURLWithPath: "/Users/someone")
+    private var primary: ClaudeProfile { .default(home: home) }
+    private var personal: ClaudeProfile {
+        ClaudeProfile(slug: "personal", configDirectory: home.appendingPathComponent(".claude-personal"))
+    }
+
+    private struct Boom: Error {}
+
+    /// A fake stored sign-in per profile: its expiry, and whether a launch
+    /// for it moves that expiry, fails to, or cannot start at all.
+    private final class FakeSignIns: @unchecked Sendable {
+        enum Renewal { case moves, staysPut, willNotStart }
+        var expiry: [String: Date] = [:]
+        var renewal: [String: Renewal] = [:]
+        var launched: [String] = []
+        let renewedUntil: Date
+        init(renewedUntil: Date) { self.renewedUntil = renewedUntil }
+    }
+
+    private func refreshers(_ signIns: FakeSignIns, profiles: [ClaudeProfile])
+        -> [(profile: ClaudeProfile, refresher: ClaudeTokenRefresher)] {
+        ClaudeTokenRefresher.forEveryProfile(
+            profiles,
+            expiry: { signIns.expiry[$0.id] },
+            reload: { signIns.expiry[$0.id] },
+            cli: URL(fileURLWithPath: "/opt/homebrew/bin/claude"),
+            launcher: { profile in
+                { _, _ in
+                    signIns.launched.append(profile.id)
+                    switch signIns.renewal[profile.id] ?? .moves {
+                    case .willNotStart: throw Boom()
+                    case .staysPut: break
+                    case .moves: signIns.expiry[profile.id] = signIns.renewedUntil
+                    }
+                    return (4242, { 1 })
+                }
+            }
+        )
+    }
+
+    func testBothProfilesAreRenewed() async {
+        let signIns = FakeSignIns(renewedUntil: now.addingTimeInterval(8 * 3600))
+        signIns.expiry = [primary.id: now.addingTimeInterval(60),
+                          personal.id: now.addingTimeInterval(90)]
+        let pairs = refreshers(signIns, profiles: [primary, personal])
+
+        for pair in pairs { await pair.refresher.considerRenewing(now: now) }
+
+        XCTAssertEqual(pairs.count, 2, "one refresher per profile")
+        XCTAssertEqual(Set(signIns.launched), [primary.id, personal.id])
+        for pair in pairs {
+            XCTAssertEqual(pair.refresher.outcome, .refreshed(until: signIns.renewedUntil),
+                           "\(pair.profile.id) was not renewed")
+        }
+    }
+
+    /// The second profile's renewal is pointed at its own directory; the
+    /// default's carries no `CLAUDE_CONFIG_DIR` at all.
+    func testEachProfileRenewsItsOwnDirectory() {
+        let pairs = refreshers(FakeSignIns(renewedUntil: now), profiles: [primary, personal])
+
+        XCTAssertNil(pairs[0].refresher.configDirectory)
+        XCTAssertEqual(pairs[1].refresher.configDirectory?.path, "/Users/someone/.claude-personal")
+    }
+
+    func testTheEnvironmentNamesTheProfileOrNothing() {
+        let stray = ["CLAUDE_CONFIG_DIR": "/somewhere/else", "HOME": "/Users/someone"]
+
+        let second = ClaudeTokenRefresher.environment(
+            base: stray, scratch: nil,
+            configDirectory: URL(fileURLWithPath: "/Users/someone/.claude-personal"))
+        XCTAssertEqual(second["CLAUDE_CONFIG_DIR"], "/Users/someone/.claude-personal")
+
+        let first = ClaudeTokenRefresher.environment(base: stray, scratch: nil, configDirectory: nil)
+        XCTAssertNil(first["CLAUDE_CONFIG_DIR"], "the default profile must not inherit a stray value")
+        XCTAssertEqual(first["HOME"], "/Users/someone")
+    }
+
+    /// A renewal that fails on the first profile does not keep the second
+    /// from renewing, in either order.
+    func testAFailureOnOneDoesNotBlockTheOther() async {
+        for (failing, healthy) in [(primary, personal), (personal, primary)] {
+            for kind in [FakeSignIns.Renewal.staysPut, .willNotStart] {
+                let signIns = FakeSignIns(renewedUntil: now.addingTimeInterval(8 * 3600))
+                signIns.expiry = [primary.id: now.addingTimeInterval(60),
+                                  personal.id: now.addingTimeInterval(60)]
+                signIns.renewal[failing.id] = kind
+                let pairs = refreshers(signIns, profiles: [primary, personal])
+
+                for pair in pairs { await pair.refresher.considerRenewing(now: now) }
+
+                let outcome = { (p: ClaudeProfile) in pairs.first { $0.profile == p }!.refresher.outcome }
+                guard case .failed = outcome(failing) else {
+                    return XCTFail("\(failing.id) (\(kind)) should have failed, got \(outcome(failing))")
+                }
+                XCTAssertEqual(outcome(healthy), .refreshed(until: signIns.renewedUntil),
+                               "\(healthy.id) was held back by \(failing.id) (\(kind))")
+            }
+        }
+    }
+
+    /// The session monitors step over a renewal's pid whichever profile
+    /// launched it.
+    func testThePidsOfEveryProfileAreIgnored() async {
+        let signIns = FakeSignIns(renewedUntil: now.addingTimeInterval(8 * 3600))
+        signIns.expiry = [primary.id: now.addingTimeInterval(60),
+                          personal.id: now.addingTimeInterval(60)]
+        final class Box: @unchecked Sendable {
+            var seen: [Set<Int32>] = []
+            var all: [ClaudeTokenRefresher] = []
+        }
+        let box = Box()
+        let pairs = ClaudeTokenRefresher.forEveryProfile(
+            [primary, personal],
+            expiry: { signIns.expiry[$0.id] },
+            reload: { [now] _ in now.addingTimeInterval(8 * 3600) },
+            cli: URL(fileURLWithPath: "/opt/homebrew/bin/claude"),
+            launcher: { profile in
+                { _, _ in
+                    let pid: Int32 = profile.slug == nil ? 100 : 200
+                    return (pid, {
+                        await MainActor.run { box.seen.append(ClaudeTokenRefresher.launchedPIDs(of: box.all)) }
+                        return 1
+                    })
+                }
+            }
+        )
+        box.all = pairs.map(\.refresher)
+
+        for pair in pairs { await pair.refresher.considerRenewing(now: now) }
+
+        XCTAssertEqual(box.seen, [[100], [200]])
+        XCTAssertTrue(ClaudeTokenRefresher.launchedPIDs(of: box.all).isEmpty)
+    }
+}
