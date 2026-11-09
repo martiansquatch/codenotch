@@ -1770,14 +1770,24 @@ final class CostRowsInCardBudgetTests: XCTestCase {
         }
     }
 
-    /// Cost rows are reserved before sessions are fitted, so a card that has
-    /// them lists no more sessions than one that does not.
+    /// Cost rows are reserved before sessions are fitted, so on a screen
+    /// where they matter a card that has them lists fewer sessions than one
+    /// that does not. Strictly fewer: 982pt is short enough that five project
+    /// rows cost at least one session on every edge (6 to 3 on a side, 12 to
+    /// 11 on the top or bottom), so a session cap solved without the rows —
+    /// the same for both cards — fails here rather than tying.
     @MainActor func testCostRowsAreReservedBeforeTheSessions() {
         for edge in NotchEdge.allCases {
             let without = model(costRows: 0, edge: edge, height: 982)
             let with = model(costRows: CostSection.maxRows, edge: edge, height: 982)
-            XCTAssertLessThanOrEqual(with.sessionCap(cellCount: 3),
-                                     without.sessionCap(cellCount: 3), "\(edge)")
+            // One budget for both: the sessions give way to the rows, not to
+            // a smaller room.
+            XCTAssertEqual(with.cardBudget(cellCount: 3), without.cardBudget(cellCount: 3),
+                           accuracy: 0.001, "\(edge)")
+            let cap = without.sessionCap(cellCount: 3)
+            XCTAssertGreaterThan(cap, 0, "\(edge): no session to give way")
+            XCTAssertLessThan(with.sessionCap(cellCount: 3), cap,
+                              "\(edge): the cost rows were not reserved before the sessions")
         }
     }
 }
