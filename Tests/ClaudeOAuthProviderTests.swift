@@ -1028,12 +1028,12 @@ final class ClaudeKeychainPromptTests: XCTestCase {
     }
 
     private func keychain(_ reads: Reads) -> ClaudeKeychain {
-        ClaudeKeychain(services: ["codenotch-test-\(UUID().uuidString)"]) { _, interactive in
+        ClaudeKeychain(services: ["codenotch-test-\(UUID().uuidString)"], reader: { _, interactive in
             reads.interactive.append(interactive)
             if reads.fails { throw UsageProviderError.accessDenied }
             return ClaudeCredentials(accessToken: "t", expiresAt: .distantFuture,
                                      subscriptionType: nil)
-        }
+        })
     }
 
     func testABackgroundReadNeverPrompts() throws {
