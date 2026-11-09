@@ -92,11 +92,11 @@ final class CodexTokenRefresherTests: XCTestCase {
         let renewed = now.addingTimeInterval(10 * 24 * 3600)
         var launched: [String] = []
 
-        let refresher = CodexTokenRefresher(profiles: [primary, personal], cli: cli) { _, profile, _, done in
+        let refresher = CodexTokenRefresher(profiles: [primary, personal], cli: cli, launcher: { _, profile, _, done in
             launched.append(profile.configDirectory.lastPathComponent)
             try self.writeSignIn(profile, expiring: renewed)   // what Codex itself does
             XCTAssertTrue(done(), "the wait should end as soon as the expiry moves")
-        }
+        })
 
         await refresher.renewDue(now: now)
 
@@ -119,13 +119,13 @@ final class CodexTokenRefresherTests: XCTestCase {
             try writeSignIn(personal, expiring: now.addingTimeInterval(3600))
             let renewed = now.addingTimeInterval(10 * 24 * 3600)
 
-            let refresher = CodexTokenRefresher(profiles: [primary, personal], cli: cli) { _, profile, _, _ in
+            let refresher = CodexTokenRefresher(profiles: [primary, personal], cli: cli, launcher: { _, profile, _, _ in
                 if profile == primary {
                     if throwing { throw Boom() }
                     return   // ran, but the expiry did not move
                 }
                 try self.writeSignIn(profile, expiring: renewed)
-            }
+            })
 
             await refresher.renewDue(now: now)
 
@@ -149,9 +149,9 @@ final class CodexTokenRefresherTests: XCTestCase {
         try writeSignIn(personal, expiring: now.addingTimeInterval(3600))           // due
         var launched: [String] = []
 
-        let refresher = CodexTokenRefresher(profiles: [primary, personal], cli: cli) { _, profile, _, _ in
+        let refresher = CodexTokenRefresher(profiles: [primary, personal], cli: cli, launcher: { _, profile, _, _ in
             launched.append(profile.id)
-        }
+        })
 
         await refresher.renewDue(now: now)
         await refresher.renewDue(now: now.addingTimeInterval(1800))
@@ -169,7 +169,7 @@ final class CodexTokenRefresherTests: XCTestCase {
         try writeSignIn(personal, expiring: now.addingTimeInterval(3600))
         var failures: [String] = []
         var recoveries: [String] = []
-        let refresher = CodexTokenRefresher(profiles: [personal], cli: cli) { _, _, _, _ in }
+        let refresher = CodexTokenRefresher(profiles: [personal], cli: cli, launcher: { _, _, _, _ in })
         refresher.onFailure = { id, _ in failures.append(id) }
         refresher.onRecovery = { recoveries.append($0) }
 
@@ -193,7 +193,7 @@ final class CodexTokenRefresherTests: XCTestCase {
         try writeSignIn(personal, expiring: expiry)
         var launches = 0
         var recoveries: [String] = []
-        let refresher = CodexTokenRefresher(profiles: [personal], cli: cli) { _, _, _, _ in launches += 1 }
+        let refresher = CodexTokenRefresher(profiles: [personal], cli: cli, launcher: { _, _, _, _ in launches += 1 })
         refresher.onRecovery = { recoveries.append($0) }
 
         await refresher.renewDue(now: now)
