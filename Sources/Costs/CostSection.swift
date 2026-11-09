@@ -14,8 +14,15 @@ struct CostSection: View {
 
     /// How many lines the card must reserve — read by the height math, so it
     /// has to agree with what `body` draws.
+    ///
+    /// None under test, for the reason `Costs.decorate` gives: a fixture cell
+    /// called "claude" would otherwise be answered by this Mac's own Claude
+    /// account, its transcripts indexed in the background while the test runs,
+    /// and a geometry assertion would pass or fail on how much the developer
+    /// had used Claude that day and how quickly the index came back.
     @MainActor static func rowCount(for snapshot: ProviderSnapshot) -> Int {
-        guard let m = CostModels.model(for: snapshot.id), m.state == .ready else { return 0 }
+        guard !Runtime.isUnderTest,
+              let m = CostModels.model(for: snapshot.id), m.state == .ready else { return 0 }
         return min(m.rows.count, maxRows)
     }
 
