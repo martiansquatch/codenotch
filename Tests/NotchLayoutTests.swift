@@ -1621,3 +1621,163 @@ final class NotchSizeTests: XCTestCase {
                        notchShare * 0.25, accuracy: 0.001)
     }
 }
+
+/// A Claude card draws up to five "what used it" rows under its sessions. The
+/// session cap used to be solved without them, so on a short screen the card
+/// they were added to ran past the budget the panel was sized for — off the
+/// top or bottom of a side edge, or off the far side of a top or bottom one.
+final class CostRowsInCardBudgetTests: XCTestCase {
+    /// The cost rows are part of the card the sessions are fitted around.
+    func testAdmittedSessionsFitAlongsideTheCostRows() {
+        for costRows in 0...CostSection.maxRows {
+            for budget in stride(from: CGFloat(150), through: 1400, by: 37) {
+                let n = NotchLayout.sessionsFitting(cardBudget: budget,
+                                                    windowCount: NotchLayout.maxWindowCount,
+                                                    costRows: costRows)
+                guard n > 0 else { continue }
+                let height = NotchLayout.cardHeight(windowCount: NotchLayout.maxWindowCount,
+                                                    groupCount: 2,
+                                                    sessionCount: n + 1, sessionCap: n,
+                                                    costRows: costRows)
+                XCTAssertLessThanOrEqual(height, budget,
+                    "\(n) sessions and \(costRows) cost rows were admitted into \(budget)pt but do not fit")
+            }
+        }
+    }
+
+    /// More project rows can only ever cost sessions, never add them.
+    func testCostRowsNeverListMoreSessions() {
+        for budget in stride(from: CGFloat(150), through: 1400, by: 37) {
+            var last = Int.max
+            for costRows in 0...CostSection.maxRows {
+                let n = NotchLayout.sessionsFitting(cardBudget: budget,
+                                                    windowCount: NotchLayout.maxWindowCount,
+                                                    costRows: costRows)
+                XCTAssertLessThanOrEqual(n, last)
+                last = n
+            }
+        }
+    }
+
+    /// Where the sessions have nothing left to give, the project rows go —
+    /// but never the headline one, and never more than were asked for.
+    func testCostRowsAreCappedToWhatFitsAndKeepTheHeadline() {
+        for wanted in 0...CostSection.maxRows {
+            for budget in stride(from: CGFloat(150), through: 1400, by: 37) {
+                let cap = NotchLayout.sessionsFitting(cardBudget: budget,
+                                                      windowCount: NotchLayout.maxWindowCount,
+                                                      costRows: wanted)
+                let rows = NotchLayout.costRowsFitting(cardBudget: budget, wanted: wanted,
+                                                       sessionCap: cap,
+                                                       windowCount: NotchLayout.maxWindowCount)
+                XCTAssertLessThanOrEqual(rows, wanted)
+                XCTAssertGreaterThanOrEqual(rows, min(wanted, 1), "the headline row was dropped")
+                if rows > 1 {
+                    let height = NotchLayout.cardHeight(windowCount: NotchLayout.maxWindowCount,
+                                                        groupCount: 2,
+                                                        sessionCount: cap + 1, sessionCap: cap,
+                                                        costRows: rows)
+                    XCTAssertLessThanOrEqual(height, budget,
+                        "\(rows) cost rows were admitted into \(budget)pt but do not fit")
+                }
+            }
+        }
+    }
+
+    /// Rows are only taken away where the sessions alone could not make room.
+    func testCostRowsStayWhenTheSessionsCanMakeRoom() {
+        let budget: CGFloat = 100_000
+        let cap = NotchLayout.sessionsFitting(cardBudget: budget,
+                                              windowCount: NotchLayout.maxWindowCount,
+                                              costRows: CostSection.maxRows)
+        XCTAssertEqual(NotchLayout.costRowsFitting(cardBudget: budget, wanted: CostSection.maxRows,
+                                                   sessionCap: cap,
+                                                   windowCount: NotchLayout.maxWindowCount),
+                       CostSection.maxRows)
+    }
+
+    // MARK: - The view model, on a real-sized short screen
+
+    private static let claude = ProviderSnapshot(
+        id: "claude", displayName: "Claude", glyph: .claude,
+        fidelity: .official, status: .ok,
+        windows: [
+            LimitWindow(id: "five_hour", label: "Session", usedFraction: 0.4),
+            LimitWindow(id: "seven_day", label: "Weekly", usedFraction: 0.3),
+            LimitWindow(id: "seven_day_opus", label: "Weekly · Opus", usedFraction: 0.2),
+            LimitWindow(id: "seven_day_sonnet", label: "Weekly · Sonnet", usedFraction: 0.1)
+        ])
+
+    private static let others = [ProviderGlyph.openai, .cursor].map { glyph in
+        ProviderSnapshot(id: glyph.rawValue, displayName: glyph.rawValue,
+                         glyph: glyph, fidelity: .official, status: .ok,
+                         windows: [LimitWindow(id: "session", label: "Session", usedFraction: 0.4)])
+    }
+
+    /// A model whose Claude card has `costRows` project rows to show, through
+    /// the seam rather than this Mac's own transcripts.
+    @MainActor private func model(costRows: Int, edge: NotchEdge, height: CGFloat) -> NotchViewModel {
+        let model = NotchViewModel()
+        model.costRowSource = { $0.id == "claude" ? costRows : 0 }
+        model.updateSnapshots([Self.claude] + Self.others)
+        model.edge = edge
+        model.screenSize = CGSize(width: 1512, height: height)
+        return model
+    }
+
+    /// The reported case: a Claude card with its cost rows, on the shortest
+    /// display a Mac ships with and a little above, on every edge. The card
+    /// must fit the budget it was solved for, the panel that budget implies
+    /// must land on the screen, and the rows the card draws are the rows it
+    /// reserved.
+    @MainActor func testAClaudeCardWithCostRowsFitsAShortScreenOnEveryEdge() {
+        for costRows in 1...CostSection.maxRows {
+            for height in stride(from: CGFloat(900), through: 1100, by: 25) {
+                for edge in NotchEdge.allCases {
+                    let model = model(costRows: costRows, edge: edge, height: height)
+                    let cells = model.snapshots.count
+                    let label = "\(edge), \(height)pt, \(costRows) cost rows"
+                    XCTAssertEqual(cells, 3, label)
+                    XCTAssertLessThanOrEqual(model.maxCardHeight(cellCount: cells),
+                                             model.cardBudget(cellCount: cells) + 0.001,
+                                             "\(label): the card is taller than its budget")
+                    let panel = model.panelSize(cellCount: cells)
+                    XCTAssertLessThanOrEqual(panel.height, height + 0.001,
+                                             "\(label): the panel runs off the screen")
+                    for cell in model.snapshots where cell.id != "claude" {
+                        XCTAssertEqual(model.costRows(for: cell), 0, label)
+                    }
+                    guard let claude = model.snapshots.first(where: { $0.id == "claude" }) else {
+                        return XCTFail("\(label): no Claude cell")
+                    }
+                    let drawn = model.costRows(for: claude)
+                    XCTAssertGreaterThanOrEqual(drawn, 1, "\(label): the headline row was dropped")
+                    XCTAssertLessThanOrEqual(drawn, costRows, label)
+                }
+            }
+        }
+    }
+
+    /// The fix must not cost a display that had room: a desk display keeps
+    /// every project row the cost model has.
+    @MainActor func testATallScreenKeepsEveryCostRow() {
+        for edge in NotchEdge.allCases {
+            let model = model(costRows: CostSection.maxRows, edge: edge, height: 1440)
+            let claude = model.snapshots.first { $0.id == "claude" }
+            XCTAssertEqual(claude.map(model.costRows(for:)), CostSection.maxRows, "\(edge)")
+            XCTAssertLessThanOrEqual(model.maxCardHeight(cellCount: 3),
+                                     model.cardBudget(cellCount: 3) + 0.001, "\(edge)")
+        }
+    }
+
+    /// Cost rows are reserved before sessions are fitted, so a card that has
+    /// them lists no more sessions than one that does not.
+    @MainActor func testCostRowsAreReservedBeforeTheSessions() {
+        for edge in NotchEdge.allCases {
+            let without = model(costRows: 0, edge: edge, height: 982)
+            let with = model(costRows: CostSection.maxRows, edge: edge, height: 982)
+            XCTAssertLessThanOrEqual(with.sessionCap(cellCount: 3),
+                                     without.sessionCap(cellCount: 3), "\(edge)")
+        }
+    }
+}

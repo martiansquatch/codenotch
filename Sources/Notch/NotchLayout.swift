@@ -590,11 +590,16 @@ enum NotchLayout {
     /// is a sum of a dozen named parts, and an inverted copy of it would have
     /// to be kept in step by hand. The range is short enough that the search
     /// costs nothing.
+    ///
+    /// `costRows` is the "what used it" section the card will draw under the
+    /// sessions, reserved like every other fixed block: the sessions are what
+    /// give way to it, and the summary line is how they do.
     static func sessionsFitting(cardBudget: CGFloat, windowCount: Int,
                                 groupCount: Int = 2,
                                 hasTokenUsage: Bool = false,
                                 hasPlan: Bool = false,
-                                hasResetCredits: Bool = false) -> Int {
+                                hasResetCredits: Bool = false,
+                                costRows: Int = 0) -> Int {
         var fits = 0
         for n in 1...sessionCeiling {
             // Costed as though something were still hidden, so that admitting
@@ -603,11 +608,40 @@ enum NotchLayout {
             let height = cardHeight(windowCount: windowCount, groupCount: groupCount,
                                     sessionCount: n + 1, sessionCap: n,
                                     hasTokenUsage: hasTokenUsage, hasPlan: hasPlan,
-                                    hasResetCredits: hasResetCredits)
+                                    hasResetCredits: hasResetCredits,
+                                    costRows: costRows)
             guard height <= cardBudget else { break }
             fits = n
         }
         return fits
+    }
+
+    /// How many of the `wanted` "what used it" rows a card may draw once its
+    /// sessions are settled at `sessionCap`.
+    ///
+    /// The sessions give way first (see `sessionsFitting`), so on most screens
+    /// this is simply `wanted`. Only where even a fully summarised session list
+    /// leaves the card taller than the screen do the project rows go, from the
+    /// bottom — the smallest shares first — down to the headline row. That one
+    /// stays whatever the screen: a section of range tabs with no project
+    /// under it says nothing, and below that point the four limit windows are
+    /// already more than the display can hold (see `sessionsFitting`).
+    static func costRowsFitting(cardBudget: CGFloat, wanted: Int,
+                                sessionCap: Int, windowCount: Int,
+                                groupCount: Int = 2,
+                                hasTokenUsage: Bool = false,
+                                hasPlan: Bool = false,
+                                hasResetCredits: Bool = false) -> Int {
+        guard wanted > 1 else { return max(0, wanted) }
+        for n in stride(from: wanted, to: 1, by: -1) {
+            let height = cardHeight(windowCount: windowCount, groupCount: groupCount,
+                                    sessionCount: sessionCap + 1, sessionCap: sessionCap,
+                                    hasTokenUsage: hasTokenUsage, hasPlan: hasPlan,
+                                    hasResetCredits: hasResetCredits,
+                                    costRows: n)
+            if height <= cardBudget { return n }
+        }
+        return 1
     }
 
     /// Past this many rows the list has stopped being glanceable, and counting

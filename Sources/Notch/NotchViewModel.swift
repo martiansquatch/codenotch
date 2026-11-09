@@ -1233,9 +1233,11 @@ final class NotchViewModel: ObservableObject {
         }
         // Extra model cells spend the gaps first. Reserve the cards actually
         // present; assuming four quota windows for every local model overflows laptops.
+        // At their smallest — no session listed, the headline project row only —
+        // since that is as far as `cardFit` will trim them to fit what is left.
         let slack = NotchLayout.slack(for: edge,
             maxCardHeight: snapshots.isEmpty ? NotchLayout.maxCardHeight(sessionCap: 0)
-                : contentCardHeight(sessionCap: 0),
+                : contentCardHeight(sessionCap: 0, costRowCap: 1),
             notchScale: sizeScale)
         let packed = NotchLayout.shapeLength(cellCount: cellCount, edge: edge,
                                              flare: flare, spacing: 0)
@@ -1331,22 +1333,57 @@ final class NotchViewModel: ObservableObject {
         snapshots.contains(where: \.hasAvailableResetCredits)
     }
 
-    func sessionCap(cellCount: Int) -> Int {
-        guard screenSize != .zero else { return NotchLayout.defaultSessionCap }
-        return NotchLayout.sessionsFitting(cardBudget: cardBudget(cellCount: cellCount),
-                                           windowCount: NotchLayout.maxWindowCount,
-                                           hasTokenUsage: hasTokenUsage,
-                                           hasPlan: hasPlan,
-                                           hasResetCredits: hasResetCredits)
+    func sessionCap(cellCount: Int) -> Int { cardFit(cellCount: cellCount).sessions }
+
+    /// What the cost model would list on a card, before the screen has its
+    /// say. A seam for the tests: under test the real answer is this Mac's own
+    /// Claude transcripts, which a geometry assertion must not depend on.
+    var costRowSource: @MainActor (ProviderSnapshot) -> Int = { CostSection.rowCount(for: $0) }
+
+    /// The most project rows any card here wants. Reserved for every card, the
+    /// way `hasTokenUsage` is: the panel is sized once for whichever is worst.
+    private var costRowsWanted: Int {
+        min(snapshots.map { costRowSource($0) }.max() ?? 0, CostSection.maxRows)
+    }
+
+    /// The session cap and the project-row cap, solved together against one
+    /// card budget for this screen and edge.
+    ///
+    /// The cost rows are reserved first, like the card's other fixed blocks,
+    /// and the sessions are fitted around them; only where no session cap can
+    /// make room do the cost rows themselves give way, down to the headline
+    /// row. See `NotchLayout.costRowsFitting`.
+    private func cardFit(cellCount: Int) -> (sessions: Int, costRows: Int) {
+        let wanted = costRowsWanted
+        guard screenSize != .zero else { return (NotchLayout.defaultSessionCap, wanted) }
+        let budget = cardBudget(cellCount: cellCount)
+        let sessions = NotchLayout.sessionsFitting(cardBudget: budget,
+                                                   windowCount: NotchLayout.maxWindowCount,
+                                                   hasTokenUsage: hasTokenUsage,
+                                                   hasPlan: hasPlan,
+                                                   hasResetCredits: hasResetCredits,
+                                                   costRows: wanted)
+        let costRows = NotchLayout.costRowsFitting(cardBudget: budget, wanted: wanted,
+                                                   sessionCap: sessions,
+                                                   windowCount: NotchLayout.maxWindowCount,
+                                                   hasTokenUsage: hasTokenUsage,
+                                                   hasPlan: hasPlan,
+                                                   hasResetCredits: hasResetCredits)
+        return (sessions, costRows)
     }
 
     /// Project rows a card may list: the ones the cost model has, capped at
-    /// what the section draws.
+    /// what the section draws and at what this screen has room for — the
+    /// figure the card both reserves and draws.
     func costRows(for snapshot: ProviderSnapshot) -> Int {
-        CostSection.rowCount(for: snapshot)
+        costRows(for: snapshot, cap: cardFit(cellCount: snapshots.count).costRows)
     }
 
-    private func contentCardHeight(sessionCap: Int) -> CGFloat {
+    private func costRows(for snapshot: ProviderSnapshot, cap: Int) -> Int {
+        min(costRowSource(snapshot), CostSection.maxRows, cap)
+    }
+
+    private func contentCardHeight(sessionCap: Int, costRowCap: Int) -> CGFloat {
         #if DEBUG
         cardHeightEvaluationCount += 1
         #endif
@@ -1369,16 +1406,16 @@ final class NotchViewModel: ObservableObject {
                 localLedgerRows: snapshot.localLedgerRowCount,
                 compactRowCount: snapshot.compactRowCount,
                 showsDeepSeekPricing: deepSeekPricingEnabled,
-                costRows: costRows(for: snapshot))
+                costRows: costRows(for: snapshot, cap: costRowCap))
         }.max() ?? 0
     }
 
     func maxCardHeight(cellCount: Int) -> CGFloat {
-        let cap = sessionCap(cellCount: cellCount)
+        let fit = cardFit(cellCount: cellCount)
         return snapshots.isEmpty
-            ? NotchLayout.maxCardHeight(sessionCap: cap, hasTokenUsage: hasTokenUsage, hasPlan: hasPlan,
+            ? NotchLayout.maxCardHeight(sessionCap: fit.sessions, hasTokenUsage: hasTokenUsage, hasPlan: hasPlan,
                                         hasResetCredits: hasResetCredits)
-            : contentCardHeight(sessionCap: cap)
+            : contentCardHeight(sessionCap: fit.sessions, costRowCap: fit.costRows)
     }
 
     /// How tall the tallest card may be before the panel runs off the screen.
@@ -1393,7 +1430,7 @@ final class NotchViewModel: ObservableObject {
     /// rather than scaling the four constants below it: at `large` a card sized
     /// against the raw height would be drawn a quarter taller than it was
     /// budgeted for, and run off the bottom of a small display.
-    private func cardBudget(cellCount: Int) -> CGFloat {
+    func cardBudget(cellCount: Int) -> CGFloat {
         if edge.isVertical {
             return screenSize.height / sizeScale
                 - shapeLength(cellCount: cellCount)
